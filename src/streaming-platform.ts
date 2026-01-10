@@ -565,11 +565,7 @@ export class StreamingPlatform {
                 </div>
                 <div class="config-item">
                   <label>
-                    Direction:
-                    <select id="direction-select">
-                      <option value="UP">UP (Buy YES token)</option>
-                      <option value="DOWN">DOWN (Buy NO token)</option>
-                    </select>
+                    <small>Direction: Automatically determined (UP or DOWN, whichever reaches entry price first)</small>
                   </label>
                 </div>
               </div>
@@ -620,7 +616,6 @@ export class StreamingPlatform {
     const profitTargetPrice = parseFloat((document.getElementById('profit-target-price') as HTMLInputElement)?.value || '100');
     const stopLossPrice = parseFloat((document.getElementById('stop-loss-price') as HTMLInputElement)?.value || '91');
     const tradeSize = parseFloat((document.getElementById('trade-size') as HTMLInputElement)?.value || '50');
-    const direction = (document.getElementById('direction-select') as HTMLSelectElement)?.value as 'UP' | 'DOWN' || 'UP';
 
     this.tradingManager.setStrategyConfig({
       enabled,
@@ -628,8 +623,6 @@ export class StreamingPlatform {
       profitTargetPrice,
       stopLossPrice,
       tradeSize,
-      direction,
-      outcome: direction === 'UP' ? 'YES' : 'NO', // Auto-set outcome based on direction
     });
 
     alert('Strategy configuration saved!');
@@ -646,14 +639,12 @@ export class StreamingPlatform {
     const profitTargetPriceInput = document.getElementById('profit-target-price') as HTMLInputElement;
     const stopLossPriceInput = document.getElementById('stop-loss-price') as HTMLInputElement;
     const tradeSizeInput = document.getElementById('trade-size') as HTMLInputElement;
-    const directionSelect = document.getElementById('direction-select') as HTMLSelectElement;
 
     if (enabledInput) enabledInput.checked = config.enabled;
     if (entryPriceInput) entryPriceInput.value = config.entryPrice.toString();
     if (profitTargetPriceInput) profitTargetPriceInput.value = config.profitTargetPrice.toString();
     if (stopLossPriceInput) stopLossPriceInput.value = config.stopLossPrice.toString();
     if (tradeSizeInput) tradeSizeInput.value = config.tradeSize.toString();
-    if (directionSelect) directionSelect.value = config.direction;
 
     // Update trading status display
     const statusDisplay = document.getElementById('trading-status-display');
@@ -664,6 +655,7 @@ export class StreamingPlatform {
             <h4>Current Position</h4>
             <div class="position-details">
               <div><strong>Event:</strong> ${status.currentPosition.eventSlug}</div>
+              <div><strong>Direction:</strong> ${status.currentPosition.direction || 'N/A'}</div>
               <div><strong>Side:</strong> ${status.currentPosition.side}</div>
               <div><strong>Entry Price:</strong> ${status.currentPosition.entryPrice.toFixed(2)}</div>
               <div><strong>Size:</strong> $${status.currentPosition.size.toFixed(2)}</div>
@@ -734,7 +726,7 @@ export class StreamingPlatform {
                 <tr class="trade-row trade-${trade.status}">
                   <td>${new Date(trade.timestamp).toLocaleTimeString()}</td>
                   <td class="event-slug">${trade.eventSlug}</td>
-                  <td><span class="side-${trade.side.toLowerCase()}">${trade.side}</span></td>
+                  <td><span class="side-${trade.side.toLowerCase()}">${trade.side}</span> ${trade.direction ? `<span class="direction-badge direction-${trade.direction.toLowerCase()}">${trade.direction}</span>` : ''}</td>
                   <td>$${trade.size.toFixed(2)}</td>
                   <td>${trade.price.toFixed(2)}${trade.orderType === 'LIMIT' && trade.limitPrice ? ` (limit: ${trade.limitPrice.toFixed(2)})` : ''}</td>
                   <td><span class="status-badge status-${trade.status}">${trade.status}</span> ${trade.orderType === 'LIMIT' ? '<span class="order-type">LIMIT</span>' : ''}</td>

@@ -8,10 +8,7 @@ export interface StrategyConfig {
   stopLossPrice: number; // e.g., 91
   // Trade size (in USD)
   tradeSize: number;
-  // Which outcome to trade (YES/UP or NO/DOWN for binary markets)
-  outcome: 'YES' | 'NO';
-  // Trade direction: 'UP' means buying YES token, 'DOWN' means buying NO token
-  direction: 'UP' | 'DOWN';
+  // Direction is automatically determined by which token (UP/DOWN) reaches entry price first
 }
 
 export interface Trade {
@@ -28,6 +25,7 @@ export interface Trade {
   reason: string; // Why the trade was executed
   orderType: 'LIMIT' | 'MARKET';
   limitPrice?: number; // Limit price if orderType is LIMIT
+  direction?: 'UP' | 'DOWN'; // Direction determined automatically (UP = YES token, DOWN = NO token)
 }
 
 export interface TradingStatus {
@@ -45,6 +43,7 @@ export interface TradingStatus {
     size: number;
     currentPrice?: number; // Price in 0-100 scale
     unrealizedProfit?: number;
+    direction?: 'UP' | 'DOWN'; // Direction (UP = YES token, DOWN = NO token)
   };
 }
 

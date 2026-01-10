@@ -40,8 +40,6 @@ export class TradingManager {
       profitTargetPrice: 100, // Take profit at 100
       stopLossPrice: 91, // Stop loss at 91
       tradeSize: 50, // $50 trade size
-      outcome: 'YES',
-      direction: 'UP', // UP = buy YES token, DOWN = buy NO token
     };
   }
 
@@ -95,6 +93,7 @@ export class TradingManager {
 
   /**
    * Check if we should place a limit order or if existing orders should fill/exit
+   * Monitors both UP (YES) and DOWN (NO) tokens and places order on whichever reaches entry price first
    */
   private async checkTradingConditions(): Promise<void> {
     if (!this.strategyConfig.enabled || !this.status.isActive) {
@@ -106,58 +105,90 @@ export class TradingManager {
     }
 
     // Check if we have token IDs for the active event
-    if (!this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length === 0) {
+    if (!this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
       return;
     }
 
-    // Determine which token to trade based on direction
-    // UP = YES token (index 0), DOWN = NO token (index 1)
-    const tokenIndex = this.strategyConfig.direction === 'UP' ? 0 : 1;
-    const tokenId = this.activeEvent.clobTokenIds[tokenIndex];
+    const yesTokenId = this.activeEvent.clobTokenIds[0]; // YES/UP token
+    const noTokenId = this.activeEvent.clobTokenIds[1]; // NO/DOWN token
 
-    if (!tokenId) {
-      console.warn('Token ID not found for direction:', this.strategyConfig.direction);
+    if (!yesTokenId || !noTokenId) {
       return;
     }
 
     // If we have a position, check exit conditions
     if (this.status.currentPosition?.eventSlug === this.activeEvent.slug) {
-      await this.checkExitConditions(tokenId);
+      const positionTokenId = this.status.currentPosition.tokenId;
+      await this.checkExitConditions(positionTokenId);
       return;
     }
 
-    // If we have a pending limit order, check if it should fill
-    if (this.pendingLimitOrders.has(tokenId)) {
-      await this.checkLimitOrderFill(tokenId);
+    // Check pending limit orders for both tokens
+    if (this.pendingLimitOrders.has(yesTokenId)) {
+      await this.checkLimitOrderFill(yesTokenId);
+      return;
+    }
+    if (this.pendingLimitOrders.has(noTokenId)) {
+      await this.checkLimitOrderFill(noTokenId);
       return;
     }
 
-    // Check if we should place a new limit order at entry price
-    await this.checkAndPlaceLimitOrder(tokenId);
+    // Check both tokens and place limit order on whichever reaches entry price first
+    await this.checkAndPlaceLimitOrder(yesTokenId, noTokenId);
   }
 
   /**
-   * Check if current market price matches entry price and place limit order
+   * Check both UP and DOWN tokens and place limit order on whichever reaches entry price first
    */
-  private async checkAndPlaceLimitOrder(tokenId: string): Promise<void> {
+  private async checkAndPlaceLimitOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
-      // Get current market price for the token
-      const currentMarketPrice = await this.clobClient.getPrice(tokenId, 'BUY');
-      
-      if (!currentMarketPrice) {
+      const entryPrice = this.strategyConfig.entryPrice;
+
+      // Get current market prices for both tokens
+      const [yesPrice, noPrice] = await Promise.all([
+        this.clobClient.getPrice(yesTokenId, 'BUY'),
+        this.clobClient.getPrice(noTokenId, 'BUY'),
+      ]);
+
+      if (!yesPrice || !noPrice) {
         return;
       }
 
       // Convert to percentage scale (0-100)
-      const currentPricePercent = toPercentage(currentMarketPrice);
-      const entryPrice = this.strategyConfig.entryPrice;
+      const yesPricePercent = toPercentage(yesPrice);
+      const noPricePercent = toPercentage(noPrice);
 
-      // Check if current price is at or near entry price (within 0.5%)
-      const priceDiff = Math.abs(currentPricePercent - entryPrice);
-      
-      if (priceDiff <= 0.5) {
-        // Place limit order at entry price
-        await this.placeLimitOrder(tokenId, entryPrice);
+      // Calculate distance from entry price for both tokens
+      const yesDistance = Math.abs(yesPricePercent - entryPrice);
+      const noDistance = Math.abs(noPricePercent - entryPrice);
+
+      // Determine which token is closer to or at entry price (within 0.5%)
+      const threshold = 0.5;
+      let tokenToTrade: string | null = null;
+      let direction: 'UP' | 'DOWN' | null = null;
+
+      if (yesDistance <= threshold && noDistance <= threshold) {
+        // Both are at entry price, choose the one that's closer
+        if (yesDistance <= noDistance) {
+          tokenToTrade = yesTokenId;
+          direction = 'UP';
+        } else {
+          tokenToTrade = noTokenId;
+          direction = 'DOWN';
+        }
+      } else if (yesDistance <= threshold) {
+        // YES token is at entry price
+        tokenToTrade = yesTokenId;
+        direction = 'UP';
+      } else if (noDistance <= threshold) {
+        // NO token is at entry price
+        tokenToTrade = noTokenId;
+        direction = 'DOWN';
+      }
+
+      // Place limit order on whichever token reached entry price first
+      if (tokenToTrade && direction) {
+        await this.placeLimitOrder(tokenToTrade, entryPrice, direction);
       }
     } catch (error) {
       console.error('Error checking for limit order placement:', error);
@@ -167,7 +198,7 @@ export class TradingManager {
   /**
    * Place a limit order at the specified price
    */
-  private async placeLimitOrder(tokenId: string, limitPrice: number): Promise<void> {
+  private async placeLimitOrder(tokenId: string, limitPrice: number, direction: 'UP' | 'DOWN'): Promise<void> {
     try {
       const trade: Trade = {
         id: `limit-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
@@ -178,7 +209,7 @@ export class TradingManager {
         price: limitPrice,
         timestamp: Date.now(),
         status: 'pending',
-        reason: `Limit order placed at ${limitPrice.toFixed(2)}`,
+        reason: `Limit order placed at ${limitPrice.toFixed(2)} (${direction})`,
         orderType: 'LIMIT',
         limitPrice,
       };
@@ -240,6 +271,9 @@ export class TradingManager {
         // Update trade status
         this.status.successfulTrades++;
 
+        // Determine direction based on which token this is
+        const direction = this.activeEvent?.clobTokenIds?.[0] === tokenId ? 'UP' : 'DOWN';
+        
         // Create position
         this.status.currentPosition = {
           eventSlug: pendingOrder.eventSlug,
@@ -247,7 +281,11 @@ export class TradingManager {
           side: pendingOrder.side,
           entryPrice: currentPricePercent,
           size: pendingOrder.size,
+          direction,
         };
+        
+        // Update trade with direction
+        pendingOrder.direction = direction;
 
         console.log(`Limit order filled: ${pendingOrder.id} at ${currentPricePercent.toFixed(2)}`);
 

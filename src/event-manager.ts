@@ -1,5 +1,5 @@
 import { PolymarketAPI, type PolymarketEvent } from './polymarket-api';
-import { getNext15MinIntervals, getPrevious15MinInterval, generateEventSlug, formatTimestamp, formatTimestampForTitle, extractTimestampFromSlug, isEventActive } from './event-utils';
+import { getNext15MinIntervals, getPrevious15MinInterval, generateEventSlug, formatTimestamp, formatTimestampForTitle, extractTimestampFromSlug } from './event-utils';
 
 export interface EventDisplayData {
   slug: string;
@@ -105,8 +105,6 @@ export class EventManager {
 
   async loadEvents(count: number = 10): Promise<void> {
     try {
-      const now = Math.floor(Date.now() / 1000);
-      
       // Get one expired event (most recent expired)
       const expiredTimestamp = getPrevious15MinInterval();
       const expiredSlug = generateEventSlug(expiredTimestamp);
@@ -159,7 +157,6 @@ export class EventManager {
     } catch (error) {
       console.error('Error loading events:', error);
       // Even on error, create placeholder events
-      const now = Math.floor(Date.now() / 1000);
       const expiredTimestamp = getPrevious15MinInterval();
       const futureTimestamps = getNext15MinIntervals(count - 1);
       

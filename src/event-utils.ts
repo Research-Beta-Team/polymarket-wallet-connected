@@ -6,8 +6,6 @@
 export function getCurrent15MinInterval(): number {
   const now = new Date();
   const minutes = now.getMinutes();
-  const seconds = now.getSeconds();
-  const milliseconds = now.getMilliseconds();
   
   // Round down to the nearest 15-minute interval
   const roundedMinutes = Math.floor(minutes / 15) * 15;
@@ -22,8 +20,6 @@ export function getNext15MinIntervals(count: number = 10): number[] {
   const intervals: number[] = [];
   const now = new Date();
   const minutes = now.getMinutes();
-  const seconds = now.getSeconds();
-  const milliseconds = now.getMilliseconds();
   
   // Round down to the nearest 15-minute interval
   const roundedMinutes = Math.floor(minutes / 15) * 15;

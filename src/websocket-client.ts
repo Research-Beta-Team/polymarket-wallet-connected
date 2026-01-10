@@ -83,7 +83,7 @@ export class WebSocketClient {
       }
     };
 
-    this.ws.onerror = (error) => {
+    this.ws.onerror = () => {
       this.handleError('WebSocket error occurred');
     };
 
