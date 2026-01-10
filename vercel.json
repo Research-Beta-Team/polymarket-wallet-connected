@@ -1,15 +1,9 @@
 {
-  "buildCommand": "npm run build",
-  "outputDirectory": "dist",
   "functions": {
     "api/**/*.ts": {
       "runtime": "@vercel/node@5.5.16"
     }
   },
-  "rewrites": [
-    {
-      "source": "/api/polymarket/:path*",
-      "destination": "/api/polymarket/:path*"
-    }
-  ]
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist"
 }

@@ -4,6 +4,14 @@ export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ) {
+  // Log immediately to verify function is being called
+  console.log('[Proxy] Function called!', {
+    method: req.method,
+    url: req.url,
+    query: req.query,
+    headers: Object.keys(req.headers),
+  });
+  
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -12,22 +20,40 @@ export default async function handler(
     return res.status(200).end();
   }
   // Get the path segments from the catch-all route
-  const pathSegments = req.query.path as string[] | string | undefined;
+  // In Vercel, catch-all routes put path segments in req.query.path as an array
+  const pathSegments = req.query.path;
   
   // Convert to array and join
   let apiPath = '';
   if (pathSegments) {
     if (Array.isArray(pathSegments)) {
       apiPath = pathSegments.join('/');
-    } else {
+    } else if (typeof pathSegments === 'string') {
       apiPath = pathSegments;
     }
   }
+  
+  // Fallback: Extract from URL if path is not in query
+  if (!apiPath && req.url) {
+    const urlMatch = req.url.match(/\/api\/polymarket\/(.+?)(?:\?|$)/);
+    if (urlMatch && urlMatch[1]) {
+      apiPath = urlMatch[1];
+    }
+  }
+  
+  // Log for debugging
+  console.log('[Proxy] Path extraction:', {
+    queryPath: req.query.path,
+    extractedPath: apiPath,
+    url: req.url,
+    query: req.query,
+  });
   
   if (!apiPath) {
     return res.status(400).json({
       error: 'No API path provided',
       query: req.query,
+      url: req.url,
     });
   }
   

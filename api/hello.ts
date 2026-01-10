@@ -4,17 +4,17 @@ export default async function handler(
   req: VercelRequest,
   res: VercelResponse
 ) {
-  console.log('[Test] Function called!', {
+  console.log('[Hello] Function executed at:', new Date().toISOString());
+  console.log('[Hello] Request details:', {
     method: req.method,
     url: req.url,
     query: req.query,
   });
   
   return res.status(200).json({
-    message: 'API proxy is working',
+    message: 'Hello from Vercel serverless function!',
     timestamp: new Date().toISOString(),
     query: req.query,
     url: req.url,
-    environment: process.env.NODE_ENV || 'production',
   });
 }
