@@ -35,26 +35,39 @@ export interface PolymarketEvent {
 export class PolymarketAPI {
   static async fetchEventBySlug(slug: string): Promise<PolymarketEvent | null> {
     try {
-      const response = await fetch(`${GAMMA_API_BASE}/events/slug/${slug}`, {
+      const apiUrl = `${GAMMA_API_BASE}/events/slug/${slug}`;
+      console.log(`[PolymarketAPI] Fetching: ${apiUrl}`);
+      
+      const response = await fetch(apiUrl, {
         method: 'GET',
         headers: {
           'Accept': 'application/json',
         },
         // Add mode to handle CORS
         mode: 'cors',
+        cache: 'no-cache',
       });
+      
+      console.log(`[PolymarketAPI] Response status: ${response.status} for ${slug}`);
       
       if (!response.ok) {
         if (response.status === 404) {
           return null; // Event not found
         }
+        const errorText = await response.text().catch(() => '');
+        console.error(`[PolymarketAPI] Error ${response.status}:`, errorText);
         throw new Error(`Failed to fetch event: ${response.status} ${response.statusText}`);
       }
       
       const data = await response.json();
       
       // Log the raw response for debugging (remove in production if needed)
-      console.log(`API Response for ${slug}:`, data);
+      console.log(`[PolymarketAPI] Response for ${slug}:`, {
+        hasConditionId: !!data.conditionId || !!data.condition_id,
+        hasQuestionId: !!data.questionID || !!data.questionId,
+        hasClobTokenIds: !!data.clobTokenIds || !!data.clob_token_ids,
+        marketsCount: data.markets?.length || 0,
+      });
       
       // Polymarket API returns nested structure, extract the fields we need
       // Try multiple possible locations for these fields
