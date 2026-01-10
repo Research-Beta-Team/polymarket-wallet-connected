@@ -61,13 +61,26 @@ export class PolymarketAPI {
       
       const data = await response.json();
       
-      // Log the raw response for debugging (remove in production if needed)
+      // Log the raw response structure for debugging
       console.log(`[PolymarketAPI] Response for ${slug}:`, {
         hasConditionId: !!data.conditionId || !!data.condition_id,
         hasQuestionId: !!data.questionID || !!data.questionId,
         hasClobTokenIds: !!data.clobTokenIds || !!data.clob_token_ids,
         marketsCount: data.markets?.length || 0,
+        market0Structure: data.markets?.[0] ? {
+          hasClobTokenIds: !!data.markets[0].clobTokenIds,
+          hasTokens: !!data.markets[0].tokens,
+          tokensCount: data.markets[0].tokens?.length || 0,
+          hasConditionId: !!data.markets[0].conditionId || !!data.markets[0].condition_id,
+          hasQuestionId: !!data.markets[0].questionID || !!data.markets[0].questionId,
+        } : 'no markets',
+        fullDataKeys: Object.keys(data),
       });
+      
+      // Log full response for debugging (commented out in production)
+      if (process.env.NODE_ENV === 'development') {
+        console.log(`[PolymarketAPI] Full response for ${slug}:`, JSON.stringify(data, null, 2).substring(0, 2000));
+      }
       
       // Polymarket API returns nested structure, extract the fields we need
       // Try multiple possible locations for these fields
@@ -84,23 +97,55 @@ export class PolymarketAPI {
       };
       
       const extractClobTokenIds = (d: any): string[] | undefined => {
+        console.log('[extractClobTokenIds] Starting extraction. Data structure:', {
+          hasMarkets: !!d.markets,
+          marketsLength: d.markets?.length || 0,
+          hasTopLevelClobTokenIds: !!d.clobTokenIds,
+          hasTopLevelTokens: !!d.tokens,
+        });
+        
         // Check markets array first (most common location based on API response)
         if (d.markets && Array.isArray(d.markets) && d.markets.length > 0) {
           const market = d.markets[0];
+          console.log('[extractClobTokenIds] Market[0] keys:', Object.keys(market));
+          console.log('[extractClobTokenIds] Market[0] structure:', {
+            hasClobTokenIds: !!market.clobTokenIds,
+            clobTokenIdsType: typeof market.clobTokenIds,
+            hasTokens: !!market.tokens,
+            tokensLength: market.tokens?.length || 0,
+            tokensStructure: market.tokens?.[0] ? Object.keys(market.tokens[0]) : [],
+          });
+          
+          // Try clobTokenIds in market
           if (market.clobTokenIds) {
             if (typeof market.clobTokenIds === 'string') {
               try {
                 const parsed = JSON.parse(market.clobTokenIds);
                 if (Array.isArray(parsed)) {
-                  console.log('Extracted clobTokenIds from markets[0]:', parsed);
+                  console.log('[extractClobTokenIds] ✓ Found in markets[0].clobTokenIds (parsed):', parsed);
                   return parsed;
                 }
               } catch (e) {
-                console.warn('Failed to parse markets[0].clobTokenIds as JSON:', e);
+                console.warn('[extractClobTokenIds] Failed to parse markets[0].clobTokenIds as JSON:', e);
               }
             } else if (Array.isArray(market.clobTokenIds)) {
-              console.log('Extracted clobTokenIds from markets[0] (already array):', market.clobTokenIds);
+              console.log('[extractClobTokenIds] ✓ Found in markets[0].clobTokenIds (array):', market.clobTokenIds);
               return market.clobTokenIds;
+            }
+          }
+          
+          // Try tokens array in market (most reliable source)
+          if (market.tokens && Array.isArray(market.tokens) && market.tokens.length > 0) {
+            const tokenIds = market.tokens
+              .map((t: any) => {
+                const id = t.token_id || t.tokenId || t.id || t.clobTokenId;
+                console.log('[extractClobTokenIds] Token structure:', { id, allKeys: Object.keys(t) });
+                return id;
+              })
+              .filter(Boolean);
+            if (tokenIds.length > 0) {
+              console.log('[extractClobTokenIds] ✓ Found in markets[0].tokens:', tokenIds);
+              return tokenIds;
             }
           }
         }
@@ -111,14 +156,14 @@ export class PolymarketAPI {
             try {
               const parsed = JSON.parse(d.clobTokenIds);
               if (Array.isArray(parsed)) {
-                console.log('Extracted clobTokenIds from top level:', parsed);
+                console.log('[extractClobTokenIds] ✓ Found in top-level clobTokenIds (parsed):', parsed);
                 return parsed;
               }
             } catch (e) {
-              console.warn('Failed to parse clobTokenIds as JSON:', e);
+              console.warn('[extractClobTokenIds] Failed to parse clobTokenIds as JSON:', e);
             }
           } else if (Array.isArray(d.clobTokenIds)) {
-            console.log('Extracted clobTokenIds from top level (already array):', d.clobTokenIds);
+            console.log('[extractClobTokenIds] ✓ Found in top-level clobTokenIds (array):', d.clobTokenIds);
             return d.clobTokenIds;
           }
         }
@@ -129,28 +174,38 @@ export class PolymarketAPI {
             try {
               const parsed = JSON.parse(d.clob_token_ids);
               if (Array.isArray(parsed)) {
+                console.log('[extractClobTokenIds] ✓ Found in clob_token_ids (parsed):', parsed);
                 return parsed;
               }
             } catch (e) {
               // Ignore parse errors
             }
           } else if (Array.isArray(d.clob_token_ids)) {
+            console.log('[extractClobTokenIds] ✓ Found in clob_token_ids (array):', d.clob_token_ids);
             return d.clob_token_ids;
           }
         }
         
         // Try extracting from tokens/outcomes arrays
         if (d.tokens && Array.isArray(d.tokens)) {
-          return d.tokens.map((t: any) => t.token_id || t.tokenId || t.id).filter(Boolean);
-        }
-        if (d.markets?.[0]?.tokens && Array.isArray(d.markets[0].tokens)) {
-          return d.markets[0].tokens.map((t: any) => t.token_id || t.tokenId || t.id).filter(Boolean);
+          const tokenIds = d.tokens.map((t: any) => t.token_id || t.tokenId || t.id).filter(Boolean);
+          if (tokenIds.length > 0) {
+            console.log('[extractClobTokenIds] ✓ Found in top-level tokens:', tokenIds);
+            return tokenIds;
+          }
         }
         if (d.outcomes && Array.isArray(d.outcomes)) {
-          return d.outcomes.map((o: any) => o.token_id || o.tokenId || o.id).filter(Boolean);
+          const tokenIds = d.outcomes.map((o: any) => o.token_id || o.tokenId || o.id).filter(Boolean);
+          if (tokenIds.length > 0) {
+            console.log('[extractClobTokenIds] ✓ Found in outcomes:', tokenIds);
+            return tokenIds;
+          }
         }
         
-        console.warn('Could not find clobTokenIds in any location');
+        console.warn('[extractClobTokenIds] ✗ Could not find clobTokenIds. Full data keys:', Object.keys(d));
+        if (d.markets?.[0]) {
+          console.warn('[extractClobTokenIds] Market[0] full structure:', JSON.stringify(d.markets[0], null, 2).substring(0, 1000));
+        }
         return undefined;
       };
       

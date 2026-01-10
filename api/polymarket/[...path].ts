@@ -73,6 +73,19 @@ export default async function handler(
 
     const data = await response.json();
     
+    // Log response structure for debugging (only for events endpoints)
+    if (apiPath.includes('events/slug')) {
+      console.log(`[Proxy] Response structure for ${apiPath}:`, {
+        hasMarkets: !!data.markets,
+        marketsLength: data.markets?.length || 0,
+        hasClobTokenIds: !!data.clobTokenIds || !!data.clob_token_ids,
+        hasConditionId: !!data.conditionId || !!data.condition_id,
+        hasQuestionId: !!data.questionID || !!data.questionId,
+        market0ClobTokenIds: data.markets?.[0]?.clobTokenIds ? 'exists' : 'missing',
+        market0Tokens: data.markets?.[0]?.tokens?.length || 0,
+      });
+    }
+    
     // Set CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
