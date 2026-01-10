@@ -368,20 +368,71 @@ export class StreamingPlatform {
         fetch(`/api/clob-proxy?side=BUY&token_id=${downTokenId}`),
       ]);
 
+      // Check if response is actually JSON (not TypeScript source)
       if (upPriceResult.ok) {
-        const upData = await upPriceResult.json();
-        this.upPrice = upData.price ? parseFloat(upData.price) * 100 : null; // Convert to 0-100 scale
+        const contentType = upPriceResult.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+          const upData = await upPriceResult.json();
+          this.upPrice = upData.price ? parseFloat(upData.price) * 100 : null; // Convert to 0-100 scale
+        } else {
+          console.warn('UP price response is not JSON, trying direct API call');
+          // Try direct API call as fallback
+          await this.fetchPriceDirectly(upTokenId, 'up');
+        }
       }
 
       if (downPriceResult.ok) {
-        const downData = await downPriceResult.json();
-        this.downPrice = downData.price ? parseFloat(downData.price) * 100 : null; // Convert to 0-100 scale
+        const contentType = downPriceResult.headers.get('content-type');
+        if (contentType && contentType.includes('application/json')) {
+          const downData = await downPriceResult.json();
+          this.downPrice = downData.price ? parseFloat(downData.price) * 100 : null; // Convert to 0-100 scale
+        } else {
+          console.warn('DOWN price response is not JSON, trying direct API call');
+          // Try direct API call as fallback
+          await this.fetchPriceDirectly(downTokenId, 'down');
+        }
       }
 
       // Update DOM elements directly for smoother updates
       this.updateUpDownPriceDisplay();
     } catch (error) {
       console.error('Error fetching UP/DOWN prices:', error);
+      // Fallback to direct API calls if proxy fails
+      try {
+        if (upTokenId) await this.fetchPriceDirectly(upTokenId, 'up');
+        if (downTokenId) await this.fetchPriceDirectly(downTokenId, 'down');
+      } catch (fallbackError) {
+        console.error('Fallback price fetch also failed:', fallbackError);
+      }
+    }
+  }
+
+  /**
+   * Fallback: Fetch price directly from CLOB API (if proxy fails)
+   */
+  private async fetchPriceDirectly(tokenId: string, type: 'up' | 'down'): Promise<void> {
+    try {
+      // Use CORS proxy or direct call
+      const response = await fetch(`https://clob.polymarket.com/price?side=BUY&token_id=${tokenId}`, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+        },
+        mode: 'cors',
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const price = data.price ? parseFloat(data.price) * 100 : null;
+        if (type === 'up') {
+          this.upPrice = price;
+        } else {
+          this.downPrice = price;
+        }
+        this.updateUpDownPriceDisplay();
+      }
+    } catch (error) {
+      console.error(`Error fetching ${type} price directly:`, error);
     }
   }
 

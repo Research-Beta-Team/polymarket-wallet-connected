@@ -10,6 +10,12 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api\/polymarket/, ''),
         secure: true,
+      },
+      '/api/clob-proxy': {
+        target: 'https://clob.polymarket.com',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/clob-proxy/, '/price'),
+        secure: true,
       }
     }
   }
