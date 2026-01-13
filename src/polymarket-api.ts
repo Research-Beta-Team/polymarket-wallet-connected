@@ -118,7 +118,25 @@ export class PolymarketAPI {
           hasTopLevelTokens: !!d.tokens,
         });
         
-        // Check markets array first (most common location based on API response)
+        // Try top-level clobTokenIds first (for /markets/slug/ endpoint)
+        if (d.clobTokenIds) {
+          if (typeof d.clobTokenIds === 'string') {
+            try {
+              const parsed = JSON.parse(d.clobTokenIds);
+              if (Array.isArray(parsed)) {
+                console.log('[extractClobTokenIds] ✓ Found in top-level clobTokenIds (parsed):', parsed);
+                return parsed;
+              }
+            } catch (e) {
+              console.warn('[extractClobTokenIds] Failed to parse clobTokenIds as JSON:', e);
+            }
+          } else if (Array.isArray(d.clobTokenIds)) {
+            console.log('[extractClobTokenIds] ✓ Found in top-level clobTokenIds (array):', d.clobTokenIds);
+            return d.clobTokenIds;
+          }
+        }
+        
+        // Check markets array (for other endpoints that return nested structure)
         if (d.markets && Array.isArray(d.markets) && d.markets.length > 0) {
           const market = d.markets[0];
           console.log('[extractClobTokenIds] Market[0] keys:', Object.keys(market));
@@ -164,25 +182,7 @@ export class PolymarketAPI {
           }
         }
         
-        // Try top-level clobTokenIds
-        if (d.clobTokenIds) {
-          if (typeof d.clobTokenIds === 'string') {
-            try {
-              const parsed = JSON.parse(d.clobTokenIds);
-              if (Array.isArray(parsed)) {
-                console.log('[extractClobTokenIds] ✓ Found in top-level clobTokenIds (parsed):', parsed);
-                return parsed;
-              }
-            } catch (e) {
-              console.warn('[extractClobTokenIds] Failed to parse clobTokenIds as JSON:', e);
-            }
-          } else if (Array.isArray(d.clobTokenIds)) {
-            console.log('[extractClobTokenIds] ✓ Found in top-level clobTokenIds (array):', d.clobTokenIds);
-            return d.clobTokenIds;
-          }
-        }
-        
-        // Try other possible locations
+        // Try other possible locations (clob_token_ids, tokens, outcomes)
         if (d.clob_token_ids) {
           if (typeof d.clob_token_ids === 'string') {
             try {
