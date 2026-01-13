@@ -101,15 +101,26 @@ export default async function handler(
     
     // Log response structure for debugging (only for events endpoints)
     if (apiPath.includes('events/slug')) {
+      const market0 = data.markets?.[0];
       console.log(`[Proxy] Response structure for ${apiPath}:`, {
         hasMarkets: !!data.markets,
         marketsLength: data.markets?.length || 0,
         hasClobTokenIds: !!data.clobTokenIds || !!data.clob_token_ids,
         hasConditionId: !!data.conditionId || !!data.condition_id,
         hasQuestionId: !!data.questionID || !!data.questionId,
-        market0ClobTokenIds: data.markets?.[0]?.clobTokenIds ? 'exists' : 'missing',
-        market0Tokens: data.markets?.[0]?.tokens?.length || 0,
+        market0ClobTokenIds: market0?.clobTokenIds ? 'exists' : 'missing',
+        market0Tokens: market0?.tokens?.length || 0,
+        market0ConditionId: market0?.conditionId || market0?.condition_id || 'missing',
+        market0QuestionId: market0?.questionID || market0?.questionId || market0?.question_id || 'missing',
+        market0TokenIds: market0?.tokens?.map((t: any) => t.token_id || t.tokenId || t.id).filter(Boolean) || [],
+        // Log first 500 chars of full response for debugging
+        fullResponseSample: JSON.stringify(data).substring(0, 500),
       });
+      
+      // Also log the full market structure if available
+      if (market0) {
+        console.log(`[Proxy] Market[0] full structure:`, JSON.stringify(market0, null, 2).substring(0, 2000));
+      }
     }
     
     // Set CORS headers

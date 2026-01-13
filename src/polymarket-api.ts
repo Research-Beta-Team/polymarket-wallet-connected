@@ -62,20 +62,32 @@ export class PolymarketAPI {
       const data = await response.json();
       
       // Log the raw response structure for debugging
+      const market0 = data.markets?.[0];
       console.log(`[PolymarketAPI] Response for ${slug}:`, {
         hasConditionId: !!data.conditionId || !!data.condition_id,
         hasQuestionId: !!data.questionID || !!data.questionId,
         hasClobTokenIds: !!data.clobTokenIds || !!data.clob_token_ids,
         marketsCount: data.markets?.length || 0,
-        market0Structure: data.markets?.[0] ? {
-          hasClobTokenIds: !!data.markets[0].clobTokenIds,
-          hasTokens: !!data.markets[0].tokens,
-          tokensCount: data.markets[0].tokens?.length || 0,
-          hasConditionId: !!data.markets[0].conditionId || !!data.markets[0].condition_id,
-          hasQuestionId: !!data.markets[0].questionID || !!data.markets[0].questionId,
+        market0Structure: market0 ? {
+          hasClobTokenIds: !!market0.clobTokenIds,
+          clobTokenIdsValue: market0.clobTokenIds,
+          clobTokenIdsType: typeof market0.clobTokenIds,
+          hasTokens: !!market0.tokens,
+          tokensCount: market0.tokens?.length || 0,
+          tokenIds: market0.tokens?.map((t: any) => t.token_id || t.tokenId || t.id).filter(Boolean) || [],
+          hasConditionId: !!market0.conditionId || !!market0.condition_id,
+          conditionIdValue: market0.conditionId || market0.condition_id,
+          hasQuestionId: !!market0.questionID || !!market0.questionId || !!market0.question_id,
+          questionIdValue: market0.questionID || market0.questionId || market0.question_id,
+          allKeys: Object.keys(market0),
         } : 'no markets',
         fullDataKeys: Object.keys(data),
       });
+      
+      // Log full response in development or if extraction fails
+      if (process.env.NODE_ENV === 'development' || !market0?.clobTokenIds) {
+        console.log(`[PolymarketAPI] Full response for ${slug}:`, JSON.stringify(data, null, 2).substring(0, 3000));
+      }
       
       // Log full response for debugging (commented out in production)
       if (process.env.NODE_ENV === 'development') {
@@ -214,6 +226,33 @@ export class PolymarketAPI {
       const extractedConditionId = extractConditionId(data);
       const extractedQuestionId = extractQuestionId(data);
       
+      // Log extraction results
+      console.log(`[PolymarketAPI] Extraction results for ${slug}:`, {
+        conditionId: extractedConditionId || 'NOT FOUND',
+        questionId: extractedQuestionId || 'NOT FOUND',
+        clobTokenIds: extractedClobTokenIds || 'NOT FOUND',
+        clobTokenIdsCount: extractedClobTokenIds?.length || 0,
+      });
+      
+      // If extraction failed, log warning and try to find alternative locations
+      if (!extractedClobTokenIds || !extractedConditionId || !extractedQuestionId) {
+        console.warn(`[PolymarketAPI] ⚠️ Missing data for ${slug}:`, {
+          missingClobTokenIds: !extractedClobTokenIds,
+          missingConditionId: !extractedConditionId,
+          missingQuestionId: !extractedQuestionId,
+        });
+        
+        // Try to extract from alternative locations as last resort
+        if (!extractedClobTokenIds && data.markets?.[0]?.tokens) {
+          const altTokenIds = data.markets[0].tokens
+            .map((t: any) => t.token_id || t.tokenId || t.id || t.clobTokenId)
+            .filter(Boolean);
+          if (altTokenIds.length > 0) {
+            console.log(`[PolymarketAPI] Found alternative token IDs:`, altTokenIds);
+          }
+        }
+      }
+      
       const event: PolymarketEvent = {
         slug: data.slug || '',
         title: data.title || data.question || '',
@@ -237,13 +276,14 @@ export class PolymarketAPI {
       event.questionID = extractedQuestionId;
       event.clobTokenIds = extractedClobTokenIds as string[];
       
-      console.log(`Extracted event data for ${slug}:`, {
-        conditionId: event.conditionId,
-        questionId: event.questionId,
-        questionID: event.questionID,
-        clobTokenIds: event.clobTokenIds,
+      console.log(`[PolymarketAPI] Final event data for ${slug}:`, {
+        conditionId: event.conditionId || 'MISSING',
+        questionId: event.questionId || 'MISSING',
+        questionID: event.questionID || 'MISSING',
+        clobTokenIds: event.clobTokenIds || 'MISSING',
         clobTokenIdsType: typeof event.clobTokenIds,
-        clobTokenIdsIsArray: Array.isArray(event.clobTokenIds)
+        clobTokenIdsIsArray: Array.isArray(event.clobTokenIds),
+        clobTokenIdsLength: Array.isArray(event.clobTokenIds) ? event.clobTokenIds.length : 0,
       });
       
       return event;
