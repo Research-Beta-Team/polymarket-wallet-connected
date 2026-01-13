@@ -606,6 +606,113 @@ header h1 {
   display: inline-block;
 }
 
+.wallet-section {
+  padding: 30px;
+  background: white;
+  border-top: 1px solid #e9ecef;
+}
+
+.wallet-section h2 {
+  margin-bottom: 20px;
+  color: #212529;
+  font-size: 1.5rem;
+}
+
+.wallet-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.wallet-status {
+  background: #f8f9fa;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #e9ecef;
+}
+
+.wallet-status-display {
+  margin-bottom: 15px;
+}
+
+.wallet-status-loading {
+  color: #667eea;
+  font-weight: 600;
+}
+
+.wallet-status-connected {
+  color: #28a745;
+  font-weight: 600;
+}
+
+.wallet-status-initialized {
+  color: #28a745;
+  font-weight: 600;
+  margin-top: 5px;
+  font-size: 0.9rem;
+}
+
+.wallet-status-disconnected {
+  color: #6c757d;
+  font-weight: 600;
+}
+
+.wallet-status-error {
+  color: #dc3545;
+  font-weight: 600;
+}
+
+.wallet-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.wallet-info {
+  background: #f8f9fa;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #e9ecef;
+}
+
+.wallet-info h3 {
+  margin-bottom: 15px;
+  color: #212529;
+  font-size: 1.2rem;
+}
+
+.wallet-details {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.wallet-detail-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid #e9ecef;
+}
+
+.wallet-detail-item:last-child {
+  border-bottom: none;
+}
+
+.wallet-detail-item .detail-label {
+  font-weight: 600;
+  color: #495057;
+}
+
+.wallet-detail-item .detail-value {
+  color: #212529;
+  font-family: 'Courier New', monospace;
+  font-size: 0.9rem;
+  word-break: break-all;
+  text-align: right;
+  max-width: 60%;
+}
+
 .trading-section {
   padding: 30px;
   background: white;

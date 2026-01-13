@@ -19,6 +19,9 @@ export class TradingManager {
   private monitoringInterval: number | null = null;
   private activeEvent: EventDisplayData | null = null;
   private pendingLimitOrders: Map<string, Trade> = new Map(); // Map of tokenId -> pending limit order
+  private currentPrice: number | null = null; // Current BTC/USD price
+  private priceToBeat: number | null = null; // Price to Beat for active event
+  private apiCredentials: { key: string; secret: string; passphrase: string } | null = null; // API credentials for order placement
 
   constructor() {
     this.clobClient = new CLOBClientWrapper();
@@ -80,15 +83,31 @@ export class TradingManager {
   }
 
   updateMarketData(
-    _currentPrice: number | null,
-    _priceToBeat: number | null,
+    currentPrice: number | null,
+    priceToBeat: number | null,
     activeEvent: EventDisplayData | null
   ): void {
+    this.currentPrice = currentPrice;
+    this.priceToBeat = priceToBeat;
     this.activeEvent = activeEvent;
 
     if (this.strategyConfig.enabled && this.status.isActive && activeEvent) {
       this.checkTradingConditions();
     }
+  }
+
+  /**
+   * Set API credentials for order placement
+   */
+  setApiCredentials(credentials: { key: string; secret: string; passphrase: string } | null): void {
+    this.apiCredentials = credentials;
+  }
+
+  /**
+   * Get API credentials
+   */
+  getApiCredentials(): { key: string; secret: string; passphrase: string } | null {
+    return this.apiCredentials;
   }
 
   /**
@@ -102,6 +121,24 @@ export class TradingManager {
 
     if (!this.activeEvent) {
       return;
+    }
+
+    // Check Price Difference condition if configured
+    if (this.strategyConfig.priceDifference !== null && this.strategyConfig.priceDifference !== undefined) {
+      if (this.currentPrice === null || this.priceToBeat === null) {
+        // Need both prices to check condition
+        return;
+      }
+
+      const priceDiff = Math.abs(this.priceToBeat - this.currentPrice);
+      const targetDiff = this.strategyConfig.priceDifference;
+      const threshold = 0.01; // Small threshold for floating point comparison
+
+      // Only proceed if price difference matches (within threshold)
+      if (Math.abs(priceDiff - targetDiff) > threshold) {
+        // Price difference condition not met, skip trading
+        return;
+      }
     }
 
     // Check if we have token IDs for the active event
@@ -197,6 +234,7 @@ export class TradingManager {
 
   /**
    * Place a limit order at the specified price
+   * Uses API if credentials are available, otherwise simulates
    */
   private async placeLimitOrder(tokenId: string, limitPrice: number, direction: 'UP' | 'DOWN'): Promise<void> {
     try {
@@ -214,20 +252,61 @@ export class TradingManager {
         limitPrice,
       };
 
-      // Store as pending limit order
-      this.pendingLimitOrders.set(tokenId, trade);
-      this.status.pendingLimitOrders = this.pendingLimitOrders.size;
+      // If API credentials are available, place real order
+      if (this.apiCredentials) {
+        try {
+          // Convert price from 0-100 scale to 0-1 decimal
+          const decimalPrice = limitPrice / 100;
+          
+          // Calculate shares from USD size (size / price)
+          const shares = this.strategyConfig.tradeSize / decimalPrice;
+
+          const response = await fetch('/api/orders', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              tokenId,
+              price: decimalPrice,
+              size: shares,
+              side: 'BUY',
+              isMarketOrder: false,
+              apiCredentials: this.apiCredentials,
+              negRisk: false,
+            }),
+          });
+
+          const data = await response.json();
+
+          if (response.ok && data.orderId) {
+            trade.status = 'filled';
+            trade.transactionHash = data.orderId;
+            trade.reason = `Real order placed: ${data.orderId} at ${limitPrice.toFixed(2)} (${direction})`;
+            console.log(`Real limit order placed: ${data.orderId} at ${limitPrice.toFixed(2)}`);
+            this.status.successfulTrades++;
+          } else {
+            trade.status = 'failed';
+            trade.reason = `Order failed: ${data.error || 'Unknown error'}`;
+            console.error('Order placement failed:', data.error);
+            this.status.failedTrades++;
+          }
+        } catch (apiError) {
+          console.error('Error placing real order:', apiError);
+          trade.status = 'failed';
+          trade.reason = `API error: ${apiError instanceof Error ? apiError.message : 'Unknown error'}`;
+          this.status.failedTrades++;
+        }
+      } else {
+        // Simulation mode - store as pending limit order
+        this.pendingLimitOrders.set(tokenId, trade);
+        this.status.pendingLimitOrders = this.pendingLimitOrders.size;
+        console.log(`Simulated limit order placed: ${trade.id} at ${limitPrice.toFixed(2)}`);
+      }
 
       // Add to trade history
       this.trades.push(trade);
       this.status.totalTrades++;
-
-      console.log(`Limit order placed: ${trade.id} at ${limitPrice.toFixed(2)}`);
-
-      // NOTE: In production, you would:
-      // 1. Call clobClient.placeLimitOrder(tokenId, limitPrice, size, side)
-      // 2. Wait for order confirmation
-      // 3. Update trade status based on order status
 
       this.notifyTradeUpdate(trade);
       this.notifyStatusUpdate();
@@ -344,6 +423,7 @@ export class TradingManager {
 
   /**
    * Close current position with market order
+   * Uses API if credentials are available, otherwise simulates
    */
   private async closePosition(reason: string): Promise<void> {
     if (!this.status.currentPosition) {
@@ -380,22 +460,69 @@ export class TradingManager {
         size: position.size,
         price: exitPricePercent,
         timestamp: Date.now(),
-        status: 'filled',
+        status: 'pending',
         profit,
         reason: `Exit: ${reason}`,
         orderType: 'MARKET',
-        transactionHash: `0x${Math.random().toString(16).substr(2, 64)}`,
       };
+
+      // If API credentials are available, place real market order
+      if (this.apiCredentials) {
+        try {
+          // Calculate shares from USD size
+          const decimalPrice = exitPricePercent / 100;
+          const shares = position.size / decimalPrice;
+
+          const response = await fetch('/api/orders', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              tokenId: position.tokenId,
+              size: shares,
+              side: 'SELL',
+              isMarketOrder: true,
+              apiCredentials: this.apiCredentials,
+              negRisk: false,
+            }),
+          });
+
+          const data = await response.json();
+
+          if (response.ok && data.orderId) {
+            exitTrade.status = 'filled';
+            exitTrade.transactionHash = data.orderId;
+            exitTrade.reason = `Real exit order: ${data.orderId} - ${reason}`;
+            console.log(`Real exit order placed: ${data.orderId} for ${reason}`);
+            this.status.successfulTrades++;
+          } else {
+            exitTrade.status = 'failed';
+            exitTrade.reason = `Exit failed: ${data.error || 'Unknown error'}`;
+            console.error('Exit order placement failed:', data.error);
+            this.status.failedTrades++;
+          }
+        } catch (apiError) {
+          console.error('Error placing real exit order:', apiError);
+          exitTrade.status = 'failed';
+          exitTrade.reason = `API error: ${apiError instanceof Error ? apiError.message : 'Unknown error'}`;
+          this.status.failedTrades++;
+        }
+      } else {
+        // Simulation mode
+        exitTrade.status = 'filled';
+        exitTrade.transactionHash = `0x${Math.random().toString(16).substr(2, 64)}`;
+        exitTrade.reason = `Simulated exit: ${reason}`;
+        console.log(`Simulated position closed: ${reason}, Profit: $${profit.toFixed(2)}`);
+        this.status.successfulTrades++;
+      }
 
       this.trades.push(exitTrade);
       this.status.totalTrades++;
-      this.status.successfulTrades++;
       this.status.totalProfit += profit;
 
       // Clear position
       this.status.currentPosition = undefined;
-
-      console.log(`Position closed: ${reason}, Profit: $${profit.toFixed(2)}`);
 
       this.notifyTradeUpdate(exitTrade);
       this.notifyStatusUpdate();

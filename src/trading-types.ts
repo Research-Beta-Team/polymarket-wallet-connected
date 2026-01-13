@@ -8,6 +8,9 @@ export interface StrategyConfig {
   stopLossPrice: number; // e.g., 91
   // Trade size (in USD)
   tradeSize: number;
+  // Price Difference (in USD) - Strategy only activates when |Price to Beat - Current BTC Price| equals this value
+  // If not set (null/undefined), strategy works without this condition
+  priceDifference?: number | null; // e.g., 100 (only trade if BTC price moved $100 from Price to Beat)
   // Direction is automatically determined by which token (UP/DOWN) reaches entry price first
 }
 

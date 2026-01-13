@@ -23,6 +23,26 @@ export class StreamingPlatform {
   private upPrice: number | null = null; // Current UP token price (0-100 scale)
   private downPrice: number | null = null; // Current DOWN token price (0-100 scale)
   private priceUpdateInterval: number | null = null; // Interval for updating UP/DOWN prices
+  // Wallet connection state
+  private walletState: {
+    eoaAddress: string | null;
+    proxyAddress: string | null;
+    isConnected: boolean;
+    isLoading: boolean;
+    error: string | null;
+    isInitialized: boolean;
+    balance: number | null;
+    balanceLoading: boolean;
+  } = {
+    eoaAddress: null,
+    proxyAddress: null,
+    isConnected: false,
+    isLoading: false,
+    error: null,
+    isInitialized: false,
+    balance: null,
+    balanceLoading: false,
+  };
 
   constructor() {
     this.wsClient = new WebSocketClient();
@@ -45,12 +65,21 @@ export class StreamingPlatform {
   }
 
   async initialize(): Promise<void> {
-    this.render();
-    this.setupEventListeners();
-    await this.loadEvents();
-    this.eventManager.startAutoRefresh(60000); // Refresh every minute
-    this.renderTradingSection(); // Initialize trading section UI
-    this.startPriceUpdates(); // Start updating UP/DOWN prices
+    try {
+      console.log('Initializing StreamingPlatform...');
+      this.render();
+      this.setupEventListeners();
+      this.renderWalletSection(); // Initialize wallet section UI
+      console.log('Loading events...');
+      await this.loadEvents();
+      this.eventManager.startAutoRefresh(60000); // Refresh every minute
+      this.renderTradingSection(); // Initialize trading section UI
+      this.startPriceUpdates(); // Start updating UP/DOWN prices
+      console.log('StreamingPlatform initialized successfully');
+    } catch (error) {
+      console.error('Error initializing StreamingPlatform:', error);
+      throw error;
+    }
   }
 
   private setupEventListeners(): void {
@@ -70,6 +99,18 @@ export class StreamingPlatform {
         error: null
       };
       this.updateUI();
+    });
+
+    // Wallet controls
+    const connectWalletBtn = document.getElementById('connect-wallet');
+    const initializeSessionBtn = document.getElementById('initialize-session');
+
+    connectWalletBtn?.addEventListener('click', () => {
+      this.connectWallet();
+    });
+
+    initializeSessionBtn?.addEventListener('click', () => {
+      this.initializeTradingSession();
     });
 
     // Trading controls
@@ -628,7 +669,12 @@ export class StreamingPlatform {
 
   private render(): void {
     const app = document.getElementById('app');
-    if (!app) return;
+    if (!app) {
+      console.error('App element not found! Make sure index.html has <div id="app"></div>');
+      return;
+    }
+    
+    console.log('Rendering platform UI...');
 
     app.innerHTML = `
       <div class="container">
@@ -694,6 +740,36 @@ export class StreamingPlatform {
           </div>
         </div>
 
+        <div class="wallet-section" id="wallet-section">
+          <h2>Wallet Connection</h2>
+          <div class="wallet-controls">
+            <div class="wallet-status">
+              <div id="wallet-status-display"></div>
+              <div class="wallet-actions">
+                <button id="connect-wallet" class="btn btn-primary">Connect Wallet</button>
+                <button id="initialize-session" class="btn btn-primary" disabled>Initialize Trading Session</button>
+              </div>
+            </div>
+            <div class="wallet-info" id="wallet-info" style="display: none;">
+              <h3>Wallet Information</h3>
+              <div class="wallet-details">
+                <div class="wallet-detail-item">
+                  <span class="detail-label">EOA Address:</span>
+                  <span class="detail-value" id="eoa-address">--</span>
+                </div>
+                <div class="wallet-detail-item">
+                  <span class="detail-label">Proxy Address:</span>
+                  <span class="detail-value" id="proxy-address">--</span>
+                </div>
+                <div class="wallet-detail-item" id="balance-display" style="display: none;">
+                  <span class="detail-label">Balance:</span>
+                  <span class="detail-value" id="wallet-balance">--</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div class="trading-section" id="trading-section">
           <h2>Automated Trading</h2>
           <div class="trading-controls">
@@ -731,6 +807,13 @@ export class StreamingPlatform {
                   <label>
                     Trade Size (USD):
                     <input type="number" id="trade-size" value="50" min="0" step="0.01" />
+                  </label>
+                </div>
+                <div class="config-item">
+                  <label>
+                    Price Difference (USD):
+                    <input type="number" id="price-difference" value="" min="0" step="0.01" placeholder="Optional" />
+                    <small>Only trade when |Price to Beat - Current BTC Price| equals this value. Leave empty to disable.</small>
                   </label>
                 </div>
                 <div class="config-item">
@@ -786,6 +869,10 @@ export class StreamingPlatform {
     const profitTargetPrice = parseFloat((document.getElementById('profit-target-price') as HTMLInputElement)?.value || '100');
     const stopLossPrice = parseFloat((document.getElementById('stop-loss-price') as HTMLInputElement)?.value || '91');
     const tradeSize = parseFloat((document.getElementById('trade-size') as HTMLInputElement)?.value || '50');
+    const priceDifferenceInput = (document.getElementById('price-difference') as HTMLInputElement)?.value;
+    const priceDifference = priceDifferenceInput && priceDifferenceInput.trim() !== '' 
+      ? parseFloat(priceDifferenceInput) 
+      : null;
 
     this.tradingManager.setStrategyConfig({
       enabled,
@@ -793,6 +880,7 @@ export class StreamingPlatform {
       profitTargetPrice,
       stopLossPrice,
       tradeSize,
+      priceDifference,
     });
 
     alert('Strategy configuration saved!');
@@ -809,12 +897,18 @@ export class StreamingPlatform {
     const profitTargetPriceInput = document.getElementById('profit-target-price') as HTMLInputElement;
     const stopLossPriceInput = document.getElementById('stop-loss-price') as HTMLInputElement;
     const tradeSizeInput = document.getElementById('trade-size') as HTMLInputElement;
+    const priceDifferenceInput = document.getElementById('price-difference') as HTMLInputElement;
 
     if (enabledInput) enabledInput.checked = config.enabled;
     if (entryPriceInput) entryPriceInput.value = config.entryPrice.toString();
     if (profitTargetPriceInput) profitTargetPriceInput.value = config.profitTargetPrice.toString();
     if (stopLossPriceInput) stopLossPriceInput.value = config.stopLossPrice.toString();
     if (tradeSizeInput) tradeSizeInput.value = config.tradeSize.toString();
+    if (priceDifferenceInput) {
+      priceDifferenceInput.value = config.priceDifference !== null && config.priceDifference !== undefined 
+        ? config.priceDifference.toString() 
+        : '';
+    }
 
     // Update trading status display
     const statusDisplay = document.getElementById('trading-status-display');
@@ -910,6 +1004,210 @@ export class StreamingPlatform {
           </table>
         `;
       }
+    }
+  }
+
+  // Wallet connection methods
+  private async connectWallet(): Promise<void> {
+    this.walletState.isLoading = true;
+    this.walletState.error = null;
+    this.renderWalletSection();
+
+    try {
+      console.log('[Wallet] Attempting to connect...');
+      const response = await fetch('/api/wallet', {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      console.log('[Wallet] Response status:', response.status);
+      
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
+        console.error('[Wallet] Error response:', errorData);
+        throw new Error(errorData.error || `Failed to connect wallet (${response.status})`);
+      }
+
+      const data = await response.json();
+      console.log('[Wallet] Success:', data);
+
+      if (!data.eoaAddress || !data.proxyAddress) {
+        throw new Error('Invalid wallet data received');
+      }
+
+      this.walletState.eoaAddress = data.eoaAddress;
+      this.walletState.proxyAddress = data.proxyAddress;
+      this.walletState.isConnected = true;
+      this.walletState.error = null;
+
+      // Enable initialize button
+      const initBtn = document.getElementById('initialize-session') as HTMLButtonElement;
+      if (initBtn) {
+        initBtn.disabled = false;
+      }
+
+      this.renderWalletSection();
+    } catch (error) {
+      console.error('Wallet connection error:', error);
+      this.walletState.error = error instanceof Error ? error.message : 'Failed to connect wallet';
+      this.walletState.isConnected = false;
+      this.renderWalletSection();
+    } finally {
+      this.walletState.isLoading = false;
+      this.renderWalletSection();
+    }
+  }
+
+  private async initializeTradingSession(): Promise<void> {
+    if (!this.walletState.isConnected) {
+      alert('Please connect wallet first');
+      return;
+    }
+
+    this.walletState.isLoading = true;
+    this.walletState.error = null;
+    this.renderWalletSection();
+
+    try {
+      const response = await fetch('/api/wallet/initialize', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to initialize trading session');
+      }
+
+      this.walletState.isInitialized = true;
+      this.walletState.error = null;
+
+      // Store API credentials in trading manager
+      if (data.credentials) {
+        this.tradingManager.setApiCredentials(data.credentials);
+      }
+
+      // Fetch balance after initialization
+      await this.fetchBalance();
+
+      this.renderWalletSection();
+      alert('Trading session initialized successfully!');
+    } catch (error) {
+      console.error('Trading session initialization error:', error);
+      this.walletState.error = error instanceof Error ? error.message : 'Failed to initialize trading session';
+      this.walletState.isInitialized = false;
+      this.renderWalletSection();
+    } finally {
+      this.walletState.isLoading = false;
+      this.renderWalletSection();
+    }
+  }
+
+  private async fetchBalance(): Promise<void> {
+    if (!this.walletState.isConnected) {
+      return;
+    }
+
+    this.walletState.balanceLoading = true;
+    this.renderWalletSection();
+
+    try {
+      const response = await fetch('/api/wallet/balance');
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to fetch balance');
+      }
+
+      this.walletState.balance = data.balance;
+      this.renderWalletSection();
+    } catch (error) {
+      console.error('Balance fetch error:', error);
+      // Don't set error state for balance, just log it
+    } finally {
+      this.walletState.balanceLoading = false;
+      this.renderWalletSection();
+    }
+  }
+
+  private renderWalletSection(): void {
+    const statusDisplay = document.getElementById('wallet-status-display');
+    const walletInfo = document.getElementById('wallet-info');
+    const eoaAddressEl = document.getElementById('eoa-address');
+    const proxyAddressEl = document.getElementById('proxy-address');
+    const balanceEl = document.getElementById('wallet-balance');
+    const balanceDisplay = document.getElementById('balance-display');
+    const connectBtn = document.getElementById('connect-wallet') as HTMLButtonElement;
+    const initBtn = document.getElementById('initialize-session') as HTMLButtonElement;
+
+    if (statusDisplay) {
+      let statusHtml = '';
+      
+      if (this.walletState.isLoading) {
+        statusHtml = '<div class="wallet-status-loading">Loading...</div>';
+      } else if (this.walletState.error) {
+        statusHtml = `<div class="wallet-status-error">Error: ${this.walletState.error}</div>`;
+      } else if (this.walletState.isConnected) {
+        statusHtml = '<div class="wallet-status-connected">Wallet Connected</div>';
+        if (this.walletState.isInitialized) {
+          statusHtml += '<div class="wallet-status-initialized">Trading Session Initialized</div>';
+        }
+      } else {
+        statusHtml = '<div class="wallet-status-disconnected">Wallet Not Connected</div>';
+      }
+
+      statusDisplay.innerHTML = statusHtml;
+    }
+
+    if (connectBtn) {
+      connectBtn.disabled = this.walletState.isLoading;
+      connectBtn.textContent = this.walletState.isLoading ? 'Connecting...' : 'Connect Wallet';
+    }
+
+    if (initBtn) {
+      initBtn.disabled = this.walletState.isLoading || !this.walletState.isConnected || this.walletState.isInitialized;
+      initBtn.textContent = this.walletState.isLoading ? 'Initializing...' : 
+                           this.walletState.isInitialized ? 'Session Initialized' : 
+                           'Initialize Trading Session';
+    }
+
+    if (this.walletState.isConnected && walletInfo) {
+      walletInfo.style.display = 'block';
+      
+      if (eoaAddressEl) {
+        eoaAddressEl.textContent = this.walletState.eoaAddress || '--';
+      }
+      
+      if (proxyAddressEl) {
+        proxyAddressEl.textContent = this.walletState.proxyAddress || '--';
+      }
+
+      if (this.walletState.isInitialized) {
+        if (balanceDisplay) {
+          balanceDisplay.style.display = 'block';
+        }
+        
+        if (balanceEl) {
+          if (this.walletState.balanceLoading) {
+            balanceEl.textContent = 'Loading...';
+          } else if (this.walletState.balance !== null) {
+            balanceEl.textContent = `${this.walletState.balance.toFixed(2)} USDC.e`;
+          } else {
+            balanceEl.textContent = '--';
+          }
+        }
+      } else {
+        if (balanceDisplay) {
+          balanceDisplay.style.display = 'none';
+        }
+      }
+    } else if (walletInfo) {
+      walletInfo.style.display = 'none';
     }
   }
 }
