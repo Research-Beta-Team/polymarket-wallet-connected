@@ -69,7 +69,7 @@ export default async function handler(
   // Handle CORS preflight
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     return res.status(200).end();
   }
@@ -80,6 +80,74 @@ export default async function handler(
     return res.status(500).json({
       error: 'Wallet not configured. Set POLYMARKET_MAGIC_PK in environment variables',
     });
+  }
+
+  // GET - Fetch active orders
+  if (req.method === 'GET') {
+    try {
+      const { apiCredentials, proxyAddress } = req.query;
+
+      if (!apiCredentials || typeof apiCredentials !== 'string') {
+        return res.status(400).json({
+          error: 'Missing API credentials',
+        });
+      }
+
+      let credentials: { key: string; secret: string; passphrase: string };
+      try {
+        credentials = JSON.parse(apiCredentials);
+      } catch {
+        return res.status(400).json({
+          error: 'Invalid API credentials format',
+        });
+      }
+
+      if (!credentials.key || !credentials.secret || !credentials.passphrase) {
+        return res.status(400).json({
+          error: 'Invalid API credentials',
+        });
+      }
+
+      const provider = new providers.JsonRpcProvider(POLYGON_RPC_URL);
+      const wallet = new Wallet(privateKey, provider);
+      const derivedProxyAddress = proxyAddress && typeof proxyAddress === 'string' 
+        ? proxyAddress 
+        : deriveProxyAddress(wallet.address.toLowerCase());
+
+      console.log('[Orders API] Fetching active orders for proxy:', derivedProxyAddress);
+
+      const clobClient = createClobClient(req, wallet, credentials, derivedProxyAddress);
+
+      // Fetch all open orders
+      const allOrders = await clobClient.getOpenOrders();
+      console.log('[Orders API] Total open orders:', allOrders.length);
+
+      // Filter orders by proxy address (maker_address)
+      const userOrders = allOrders.filter((order: any) => {
+        const orderMaker = (order.maker_address || '').toLowerCase();
+        const proxyAddr = derivedProxyAddress.toLowerCase();
+        return orderMaker === proxyAddr;
+      });
+
+      // Filter for LIVE orders only
+      const activeOrders = userOrders.filter((order: any) => {
+        return order.status === 'LIVE';
+      });
+
+      console.log('[Orders API] Active orders for user:', activeOrders.length);
+
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.status(200).json({
+        success: true,
+        orders: activeOrders,
+        count: activeOrders.length,
+      });
+    } catch (error) {
+      console.error('[Orders API] Error fetching orders:', error);
+      return res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to fetch orders',
+      });
+    }
   }
 
   // POST - Create order
@@ -99,6 +167,14 @@ export default async function handler(
       const proxyAddress = deriveProxyAddress(wallet.address.toLowerCase());
 
       const clobClient = createClobClient(req, wallet, apiCredentials, proxyAddress);
+
+      console.log('[Orders API] Creating order:', {
+        tokenId,
+        side,
+        isMarketOrder,
+        size,
+        price: price || 'N/A (market)',
+      });
 
       let response;
 
@@ -128,10 +204,12 @@ export default async function handler(
         }
 
         if (isMarketOrder) {
-          // Market order (Fill or Kill)
+          // Market order (Fill or Kill) with builder attribution
           let marketAmount: number;
 
           if (orderSide === Side.BUY) {
+            // For BUY market orders, size parameter is number of shares
+            // Calculate dollar amount: shares * askPrice
             const priceResponse = await clobClient.getPrice(tokenId, Side.SELL);
             const askPrice = parseFloat(priceResponse.price);
             
@@ -141,8 +219,9 @@ export default async function handler(
               });
             }
             
-            marketAmount = size * askPrice;
+            marketAmount = size * askPrice; // Convert shares to dollar amount
           } else {
+            // For SELL market orders, amount is in shares
             marketAmount = size;
           }
 
@@ -189,12 +268,20 @@ export default async function handler(
       }
 
       if (response.orderID) {
+        console.log('[Orders API] Order created successfully:', {
+          orderId: response.orderID,
+          tokenId,
+          side,
+          orderType: isMarketOrder ? 'MARKET (FOK)' : 'LIMIT (GTC)',
+        });
+
         res.setHeader('Access-Control-Allow-Origin', '*');
         return res.status(200).json({
           success: true,
           orderId: response.orderID,
         });
       } else {
+        console.error('[Orders API] Order submission failed - no order ID returned');
         return res.status(500).json({
           error: 'Order submission failed - no order ID returned',
         });
@@ -230,7 +317,11 @@ export default async function handler(
 
       const clobClient = createClobClient(req, wallet, apiCredentials, proxyAddress);
 
+      console.log('[Orders API] Cancelling order:', orderId);
+
       await clobClient.cancelOrder({ orderID: orderId });
+
+      console.log('[Orders API] Order cancelled successfully:', orderId);
 
       res.setHeader('Access-Control-Allow-Origin', '*');
       return res.status(200).json({ success: true });

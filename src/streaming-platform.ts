@@ -33,6 +33,7 @@ export class StreamingPlatform {
     isInitialized: boolean;
     balance: number | null;
     balanceLoading: boolean;
+    apiCredentials: { key: string; secret: string; passphrase: string } | null;
   } = {
     eoaAddress: null,
     proxyAddress: null,
@@ -42,7 +43,9 @@ export class StreamingPlatform {
     isInitialized: false,
     balance: null,
     balanceLoading: false,
+    apiCredentials: null,
   };
+  private ordersPollingInterval: number | null = null;
 
   constructor() {
     this.wsClient = new WebSocketClient();
@@ -139,6 +142,12 @@ export class StreamingPlatform {
         this.renderTradingSection();
       }
     });
+
+    // Orders section event listeners
+    const refreshOrdersBtn = document.getElementById('refresh-orders');
+    refreshOrdersBtn?.addEventListener('click', () => {
+      this.fetchAndDisplayOrders();
+    });
   }
 
   private handlePriceUpdate(update: PriceUpdate): void {
@@ -174,12 +183,22 @@ export class StreamingPlatform {
       if (index > 0) {
         const previousEvent = events[index - 1];
         
-        // If previous event is expired and we haven't stored the last price for this event yet
+        // If previous event is expired and we haven't stored the last price for the next event yet
         if (previousEvent.status === 'expired' && !this.eventLastPrice.has(event.slug) && this.currentPrice !== null) {
-          // Store the current price as the last price (price when previous event ended)
+          // Store the current price as the last price (price at the last second of previous event)
+          // This will be used as "Price to Beat" for the next event when it becomes active
           this.eventLastPrice.set(event.slug, this.currentPrice);
-          // Re-render to show the last price
+          console.log(`[Last Price] Captured last price for event ${event.slug} from expired event ${previousEvent.slug}: $${this.currentPrice.toFixed(2)}`);
+          
+          // If this event is now active, set it as price to beat
+          if (event.status === 'active' && !this.eventPriceToBeat.has(event.slug)) {
+            this.eventPriceToBeat.set(event.slug, this.currentPrice);
+            console.log(`[Price to Beat] Set price to beat for active event ${event.slug}: $${this.currentPrice.toFixed(2)}`);
+          }
+          
+          // Re-render to show the last price and update active event
           this.renderEventsTable();
+          this.renderActiveEvent();
         }
       }
     });
@@ -194,7 +213,30 @@ export class StreamingPlatform {
     if (activeEvent) {
       // If we don't have a price to beat for this event yet, capture it
       if (!this.eventPriceToBeat.has(activeEvent.slug)) {
-        this.eventPriceToBeat.set(activeEvent.slug, this.currentPrice);
+        // Price to Beat should be the price from the last second of the previous event
+        // Check if we have the last price from the previous event
+        const activeEventIndex = events.findIndex(e => e.slug === activeEvent.slug);
+        let priceToBeat: number | null = null;
+
+        if (activeEventIndex > 0) {
+          // Get the previous event
+          const previousEvent = events[activeEventIndex - 1];
+          // Use the last price from the previous event (captured at its last second)
+          const lastPrice = this.eventLastPrice.get(previousEvent.slug);
+          if (lastPrice !== undefined) {
+            priceToBeat = lastPrice;
+            console.log(`[Price to Beat] Using last price from previous event ${previousEvent.slug}: $${priceToBeat.toFixed(2)}`);
+          }
+        }
+
+        // If we don't have the previous event's last price, use current price as fallback
+        // This handles the case where the app starts during an active event
+        if (priceToBeat === null) {
+          priceToBeat = this.currentPrice;
+          console.log(`[Price to Beat] Using current price as fallback: $${priceToBeat.toFixed(2)}`);
+        }
+
+        this.eventPriceToBeat.set(activeEvent.slug, priceToBeat);
         // Re-render active event to show the price
         this.renderActiveEvent();
       }
@@ -770,6 +812,17 @@ export class StreamingPlatform {
           </div>
         </div>
 
+        <div class="orders-section" id="orders-section">
+          <h2>Active Orders</h2>
+          <div class="orders-controls">
+            <button id="refresh-orders" class="btn btn-secondary">Refresh Orders</button>
+            <span id="orders-count" class="orders-count">Loading...</span>
+          </div>
+          <div id="orders-container" class="orders-container">
+            <p>Loading orders...</p>
+          </div>
+        </div>
+
         <div class="trading-section" id="trading-section">
           <h2>Automated Trading</h2>
           <div class="trading-controls">
@@ -1118,13 +1171,18 @@ export class StreamingPlatform {
       this.walletState.isInitialized = true;
       this.walletState.error = null;
 
-      // Store API credentials in trading manager
+      // Store API credentials in trading manager and wallet state
       if (data.credentials) {
         this.tradingManager.setApiCredentials(data.credentials);
+        this.walletState.apiCredentials = data.credentials;
       }
 
       // Fetch balance after initialization
       await this.fetchBalance();
+
+      // Start fetching orders
+      this.fetchAndDisplayOrders();
+      this.startOrdersPolling();
 
       this.renderWalletSection();
       alert('Trading session initialized successfully!');
@@ -1239,6 +1297,184 @@ export class StreamingPlatform {
       }
     } else if (walletInfo) {
       walletInfo.style.display = 'none';
+    }
+  }
+
+  /**
+   * Fetch and display active orders
+   */
+  private async fetchAndDisplayOrders(): Promise<void> {
+    if (!this.walletState.isInitialized || !this.walletState.apiCredentials || !this.walletState.proxyAddress) {
+      const ordersContainer = document.getElementById('orders-container');
+      const ordersCount = document.getElementById('orders-count');
+      if (ordersContainer) {
+        ordersContainer.innerHTML = '<p class="orders-empty">Wallet not initialized. Please initialize trading session first.</p>';
+      }
+      if (ordersCount) {
+        ordersCount.textContent = 'N/A';
+      }
+      return;
+    }
+
+    const ordersContainer = document.getElementById('orders-container');
+    const ordersCount = document.getElementById('orders-count');
+
+    if (ordersContainer) {
+      ordersContainer.innerHTML = '<p>Loading orders...</p>';
+    }
+
+    try {
+      console.log('[Orders] Fetching active orders...');
+      
+      const response = await fetch(
+        `/api/orders?apiCredentials=${encodeURIComponent(JSON.stringify(this.walletState.apiCredentials))}&proxyAddress=${encodeURIComponent(this.walletState.proxyAddress)}`
+      );
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to fetch orders');
+      }
+
+      const orders = data.orders || [];
+      console.log('[Orders] Fetched orders:', orders.length);
+
+      if (ordersCount) {
+        ordersCount.textContent = `${orders.length} active`;
+      }
+
+      if (orders.length === 0) {
+        if (ordersContainer) {
+          ordersContainer.innerHTML = '<p class="orders-empty">No active orders</p>';
+        }
+        return;
+      }
+
+      // Render orders table
+      if (ordersContainer) {
+        ordersContainer.innerHTML = `
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th>Order ID</th>
+                <th>Token ID</th>
+                <th>Side</th>
+                <th>Price</th>
+                <th>Size</th>
+                <th>Filled</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${orders.map((order: any) => `
+                <tr class="order-row" data-order-id="${order.id}">
+                  <td class="order-id">${order.id.substring(0, 8)}...</td>
+                  <td class="token-id">${order.asset_id?.substring(0, 10)}...</td>
+                  <td><span class="side-${order.side.toLowerCase()}">${order.side}</span></td>
+                  <td>${parseFloat(order.price || 0).toFixed(4)}</td>
+                  <td>${parseFloat(order.original_size || 0).toFixed(2)}</td>
+                  <td>${parseFloat(order.size_matched || 0).toFixed(2)}</td>
+                  <td><span class="status-badge status-${order.status.toLowerCase()}">${order.status}</span></td>
+                  <td>${new Date(order.created_at * 1000).toLocaleString()}</td>
+                  <td>
+                    <button class="btn-cancel-order" data-order-id="${order.id}" ${order.status !== 'LIVE' ? 'disabled' : ''}>
+                      Cancel
+                    </button>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        `;
+
+        // Add event listeners for cancel buttons
+        const cancelButtons = ordersContainer.querySelectorAll('.btn-cancel-order');
+        cancelButtons.forEach(btn => {
+          btn.addEventListener('click', async (e) => {
+            const orderId = (e.target as HTMLButtonElement).getAttribute('data-order-id');
+            if (orderId) {
+              await this.cancelOrder(orderId);
+            }
+          });
+        });
+      }
+    } catch (error) {
+      console.error('[Orders] Error fetching orders:', error);
+      if (ordersContainer) {
+        ordersContainer.innerHTML = `<p class="orders-error">Error loading orders: ${error instanceof Error ? error.message : 'Unknown error'}</p>`;
+      }
+      if (ordersCount) {
+        ordersCount.textContent = 'Error';
+      }
+    }
+  }
+
+  /**
+   * Cancel an order
+   */
+  private async cancelOrder(orderId: string): Promise<void> {
+    if (!this.walletState.apiCredentials) {
+      alert('API credentials not available');
+      return;
+    }
+
+    if (!confirm(`Are you sure you want to cancel order ${orderId.substring(0, 8)}...?`)) {
+      return;
+    }
+
+    try {
+      console.log('[Orders] Cancelling order:', orderId);
+
+      const response = await fetch('/api/orders', {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          orderId,
+          apiCredentials: this.walletState.apiCredentials,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || 'Failed to cancel order');
+      }
+
+      console.log('[Orders] ✅ Order cancelled successfully:', orderId);
+
+      // Refresh orders list
+      await this.fetchAndDisplayOrders();
+    } catch (error) {
+      console.error('[Orders] ❌ Error cancelling order:', error);
+      alert(`Failed to cancel order: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  /**
+   * Start polling for orders updates
+   */
+  private startOrdersPolling(): void {
+    this.stopOrdersPolling();
+    
+    // Poll every 5 seconds
+    this.ordersPollingInterval = window.setInterval(() => {
+      if (this.walletState.isInitialized) {
+        this.fetchAndDisplayOrders();
+      }
+    }, 5000);
+  }
+
+  /**
+   * Stop polling for orders
+   */
+  private stopOrdersPolling(): void {
+    if (this.ordersPollingInterval !== null) {
+      clearInterval(this.ordersPollingInterval);
+      this.ordersPollingInterval = null;
     }
   }
 }

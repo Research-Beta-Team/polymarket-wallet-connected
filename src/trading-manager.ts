@@ -160,7 +160,9 @@ export class TradingManager {
       return;
     }
 
-    // Check pending limit orders for both tokens
+    // Check pending limit orders for both tokens (legacy support - market orders are immediate)
+    // Note: Market orders (FOK) execute immediately, so we don't need to check for pending orders
+    // This check is kept for backward compatibility with any existing pending limit orders
     if (this.pendingLimitOrders.has(yesTokenId)) {
       await this.checkLimitOrderFill(yesTokenId);
       return;
@@ -170,15 +172,16 @@ export class TradingManager {
       return;
     }
 
-    // Check both tokens and place limit order on whichever reaches entry price first
-    await this.checkAndPlaceLimitOrder(yesTokenId, noTokenId);
+    // Check both tokens and place market order (Fill or Kill) on whichever reaches entry price first
+    // Market orders execute immediately with builder attribution via remote signing
+    await this.checkAndPlaceMarketOrder(yesTokenId, noTokenId);
   }
 
   /**
-   * Check both UP and DOWN tokens and place order when price is equal or greater than entry price
-   * Order is filled when UP or DOWN value is equal or greater to entry price
+   * Check both UP and DOWN tokens and place market order (Fill or Kill) when price is equal or greater than entry price
+   * Order is filled immediately when UP or DOWN value is >= entry price using FOK (Fill or Kill) market order
    */
-  private async checkAndPlaceLimitOrder(yesTokenId: string, noTokenId: string): Promise<void> {
+  private async checkAndPlaceMarketOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
       const entryPrice = this.strategyConfig.entryPrice;
 
@@ -212,43 +215,68 @@ export class TradingManager {
         direction = 'DOWN';
       }
 
-      // Place limit order when price is equal or greater than entry price
+      // Place market order (Fill or Kill) when price is equal or greater than entry price
+      // This ensures immediate execution with builder attribution
       if (tokenToTrade && direction) {
-        await this.placeLimitOrder(tokenToTrade, entryPrice, direction);
+        await this.placeMarketOrder(tokenToTrade, entryPrice, direction);
       }
     } catch (error) {
-      console.error('Error checking for limit order placement:', error);
+      console.error('Error checking for market order placement:', error);
     }
   }
 
   /**
-   * Place a limit order at the specified price
-   * Uses API if credentials are available, otherwise simulates
+   * Place a market order (Fill or Kill) when trading conditions match
+   * Uses builder attribution via remote signing through /api/orders endpoint
    */
-  private async placeLimitOrder(tokenId: string, limitPrice: number, direction: 'UP' | 'DOWN'): Promise<void> {
+  private async placeMarketOrder(tokenId: string, entryPrice: number, direction: 'UP' | 'DOWN'): Promise<void> {
     try {
       const trade: Trade = {
-        id: `limit-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        id: `market-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         eventSlug: this.activeEvent!.slug,
         tokenId,
         side: 'BUY', // Always buying the token (YES or NO)
         size: this.strategyConfig.tradeSize,
-        price: limitPrice,
+        price: entryPrice,
         timestamp: Date.now(),
         status: 'pending',
-        reason: `Limit order placed at ${limitPrice.toFixed(2)} (${direction})`,
-        orderType: 'LIMIT',
-        limitPrice,
+        reason: `Market order (FOK) placed at ${entryPrice.toFixed(2)} (${direction})`,
+        orderType: 'MARKET',
       };
 
-      // If API credentials are available, place real order
+      // If API credentials are available, place real market order with builder attribution
       if (this.apiCredentials) {
         try {
-          // Convert price from 0-100 scale to 0-1 decimal
-          const decimalPrice = limitPrice / 100;
+          console.log('[TradingManager] Placing market order (FOK):', {
+            tokenId,
+            direction,
+            entryPrice,
+            tradeSize: this.strategyConfig.tradeSize,
+          });
+
+          // For market orders, we need to get the current ask price to calculate shares
+          // The API expects shares for BUY market orders, then calculates dollar amount internally
+          const askPrice = await this.clobClient.getPrice(tokenId, 'SELL'); // Get ask price
           
-          // Calculate shares from USD size (size / price)
-          const shares = this.strategyConfig.tradeSize / decimalPrice;
+          if (!askPrice) {
+            throw new Error('Unable to get current market price');
+          }
+
+          if (isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
+            throw new Error('Invalid market price');
+          }
+
+          // Calculate number of shares from dollar amount
+          // shares = dollarAmount / price
+          // For example: $50 / 0.96 = 52.08 shares
+          const shares = this.strategyConfig.tradeSize / askPrice;
+
+          console.log('[TradingManager] Market order details:', {
+            askPrice: askPrice.toFixed(4),
+            askPricePercent: toPercentage(askPrice).toFixed(2),
+            tradeSizeUSD: this.strategyConfig.tradeSize,
+            shares: shares.toFixed(2),
+          });
 
           const response = await fetch('/api/orders', {
             method: 'POST',
@@ -257,10 +285,9 @@ export class TradingManager {
             },
             body: JSON.stringify({
               tokenId,
-              price: decimalPrice,
-              size: shares,
+              size: shares, // Number of shares for BUY market orders
               side: 'BUY',
-              isMarketOrder: false,
+              isMarketOrder: true, // Fill or Kill market order with builder attribution
               apiCredentials: this.apiCredentials,
               negRisk: false,
             }),
@@ -271,26 +298,66 @@ export class TradingManager {
           if (response.ok && data.orderId) {
             trade.status = 'filled';
             trade.transactionHash = data.orderId;
-            trade.reason = `Real order placed: ${data.orderId} at ${limitPrice.toFixed(2)} (${direction})`;
-            console.log(`Real limit order placed: ${data.orderId} at ${limitPrice.toFixed(2)}`);
+            trade.price = toPercentage(askPrice); // Actual fill price
+            trade.reason = `Real market order (FOK) filled: ${data.orderId} at ${trade.price.toFixed(2)} (${direction})`;
+            
+            console.log('[TradingManager] ✅ Market order (FOK) placed successfully:', {
+              orderId: data.orderId,
+              tokenId,
+              direction,
+              fillPrice: trade.price.toFixed(2),
+              tradeSize: this.strategyConfig.tradeSize,
+              builderAttribution: 'enabled',
+            });
+            
+            // Create position immediately since market order is filled
+            this.status.currentPosition = {
+              eventSlug: trade.eventSlug,
+              tokenId: trade.tokenId,
+              side: trade.side,
+              size: this.strategyConfig.tradeSize,
+              entryPrice: trade.price,
+            };
+            
             this.status.successfulTrades++;
           } else {
             trade.status = 'failed';
-            trade.reason = `Order failed: ${data.error || 'Unknown error'}`;
-            console.error('Order placement failed:', data.error);
+            trade.reason = `Market order failed: ${data.error || 'Unknown error'}`;
+            console.error('[TradingManager] ❌ Market order placement failed:', {
+              error: data.error,
+              tokenId,
+              direction,
+            });
             this.status.failedTrades++;
           }
         } catch (apiError) {
-          console.error('Error placing real order:', apiError);
+          console.error('[TradingManager] ❌ Error placing real market order:', {
+            error: apiError instanceof Error ? apiError.message : 'Unknown error',
+            tokenId,
+            direction,
+            stack: apiError instanceof Error ? apiError.stack : undefined,
+          });
           trade.status = 'failed';
           trade.reason = `API error: ${apiError instanceof Error ? apiError.message : 'Unknown error'}`;
           this.status.failedTrades++;
         }
       } else {
-        // Simulation mode - store as pending limit order
-        this.pendingLimitOrders.set(tokenId, trade);
-        this.status.pendingLimitOrders = this.pendingLimitOrders.size;
-        console.log(`Simulated limit order placed: ${trade.id} at ${limitPrice.toFixed(2)}`);
+        // Simulation mode - treat as filled immediately for market orders
+        trade.status = 'filled';
+        trade.transactionHash = `0x${Math.random().toString(16).substr(2, 64)}`;
+        trade.reason = `Simulated market order (FOK) filled at ${entryPrice.toFixed(2)} (${direction})`;
+        console.log(`Simulated market order (FOK) placed: ${trade.id} at ${entryPrice.toFixed(2)}`);
+        
+        // Create position for simulation
+        this.status.currentPosition = {
+          eventSlug: trade.eventSlug,
+          tokenId: trade.tokenId,
+          side: trade.side,
+          size: this.strategyConfig.tradeSize,
+          entryPrice: entryPrice,
+        };
+        
+        this.status.successfulTrades++;
       }
 
       // Add to trade history
@@ -300,7 +367,7 @@ export class TradingManager {
       this.notifyTradeUpdate(trade);
       this.notifyStatusUpdate();
     } catch (error) {
-      console.error('Error placing limit order:', error);
+      console.error('Error placing market order:', error);
     }
   }
 
