@@ -1175,6 +1175,9 @@ export class StreamingPlatform {
       if (data.credentials) {
         this.tradingManager.setApiCredentials(data.credentials);
         this.walletState.apiCredentials = data.credentials;
+        
+        // Initialize browser ClobClient for client-side order placement (bypasses Cloudflare)
+        await this.initializeBrowserClobClient();
       }
 
       // Fetch balance after initialization
@@ -1475,6 +1478,57 @@ export class StreamingPlatform {
     if (this.ordersPollingInterval !== null) {
       clearInterval(this.ordersPollingInterval);
       this.ordersPollingInterval = null;
+    }
+  }
+
+  /**
+   * Initialize browser ClobClient for client-side order placement (bypasses Cloudflare)
+   */
+  private async initializeBrowserClobClient(): Promise<void> {
+    if (!this.walletState.isConnected || !this.walletState.apiCredentials) {
+      console.warn('[Browser ClobClient] Cannot initialize - wallet not connected or credentials missing');
+      return;
+    }
+
+    try {
+      // Get private key from backend (for now, we'll need to pass it securely)
+      // In production, consider using a browser wallet extension instead
+      const response = await fetch('/api/wallet/private-key', {
+        method: 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (!response.ok) {
+        // If endpoint doesn't exist, fall back to server-side API
+        console.warn('[Browser ClobClient] Private key endpoint not available, will use server-side API');
+        return;
+      }
+
+      const data = await response.json();
+      if (!data.privateKey) {
+        throw new Error('Private key not returned from server');
+      }
+
+      // Import the initialization function
+      const { initializeBrowserClobClient } = await import('./streaming-platform-clob-init');
+      
+      // Initialize browser ClobClient
+      const browserClobClient = await initializeBrowserClobClient(
+        data.privateKey,
+        this.walletState.apiCredentials!,
+        this.walletState.proxyAddress!
+      );
+
+      // Set in trading manager
+      this.tradingManager.setBrowserClobClient(browserClobClient);
+
+      console.log('[Browser ClobClient] ✅ Successfully initialized and set in TradingManager');
+    } catch (error) {
+      console.error('[Browser ClobClient] ❌ Failed to initialize:', error);
+      // Don't throw - fall back to server-side API
+      console.warn('[Browser ClobClient] Will use server-side API (may be blocked by Cloudflare)');
     }
   }
 }

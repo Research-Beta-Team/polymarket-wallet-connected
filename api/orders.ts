@@ -46,7 +46,7 @@ function createClobClient(
     remoteBuilderConfig: { url: getSigningUrl(request) },
   });
 
-  return new ClobClient(
+  const clobClient = new ClobClient(
     CLOB_API_URL,
     POLYGON_CHAIN_ID,
     wallet,
@@ -57,6 +57,12 @@ function createClobClient(
     false,
     builderConfig
   );
+
+  // Try to add browser-like headers via axios interceptor if possible
+  // Note: This may not work as ClobClient uses axios internally and doesn't expose the instance
+  // The real solution is client-side order placement (like the example) or contacting Polymarket to whitelist IPs
+  
+  return clobClient;
 }
 
 /**
@@ -232,11 +238,79 @@ export default async function handler(
             feeRateBps: feeRateBps,
           };
 
-          response = await clobClient.createAndPostMarketOrder(
-            marketOrder,
-            { negRisk: negRisk ?? false },
-            OrderType.FOK
-          );
+          console.log('[Orders API] Market order details:', {
+            tokenID: marketOrder.tokenID,
+            amount: marketOrder.amount,
+            side: marketOrder.side,
+            feeRateBps: marketOrder.feeRateBps,
+            negRisk: negRisk ?? false,
+          });
+
+          // Retry logic for Cloudflare protection
+          const maxRetries = 3;
+          let lastError: any = null;
+          
+          for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+              console.log(`[Orders API] Market order attempt ${attempt}/${maxRetries}`);
+              
+              response = await clobClient.createAndPostMarketOrder(
+                marketOrder,
+                { negRisk: negRisk ?? false },
+                OrderType.FOK
+              );
+              
+              console.log('[Orders API] Market order response:', {
+                response: response,
+                hasOrderID: !!response?.orderID,
+                responseKeys: response ? Object.keys(response) : 'null',
+              });
+              
+              // Success - break out of retry loop
+              break;
+            } catch (marketOrderError: any) {
+              lastError = marketOrderError;
+              
+              // Check if it's a Cloudflare block
+              const isCloudflareBlock = 
+                marketOrderError?.response?.status === 403 ||
+                marketOrderError?.status === 403 ||
+                (typeof marketOrderError?.message === 'string' && 
+                 marketOrderError.message.includes('Cloudflare')) ||
+                (typeof marketOrderError?.data === 'string' && 
+                 marketOrderError.data.includes('Cloudflare'));
+              
+              if (isCloudflareBlock) {
+                console.warn(`[Orders API] Cloudflare block detected (attempt ${attempt}/${maxRetries})`);
+                
+                if (attempt < maxRetries) {
+                  // Exponential backoff: 2s, 4s, 8s
+                  const delay = Math.pow(2, attempt) * 1000;
+                  console.log(`[Orders API] Retrying after ${delay}ms...`);
+                  await new Promise(resolve => setTimeout(resolve, delay));
+                  continue;
+                } else {
+                  // Last attempt failed
+                  console.error('[Orders API] All retry attempts failed due to Cloudflare block');
+                  throw new Error('Order submission blocked by Cloudflare protection. Please try again later or contact support.');
+                }
+              } else {
+                // Non-Cloudflare error - throw immediately
+                console.error('[Orders API] Market order creation error:', {
+                  error: marketOrderError,
+                  message: marketOrderError instanceof Error ? marketOrderError.message : 'Unknown error',
+                  status: marketOrderError?.response?.status || marketOrderError?.status,
+                  data: marketOrderError?.response?.data || marketOrderError?.data,
+                });
+                throw marketOrderError;
+              }
+            }
+          }
+          
+          // If we exhausted retries and still no response
+          if (!response && lastError) {
+            throw lastError;
+          }
         } else {
           // Limit order (Good Till Cancelled)
           if (!price) {
@@ -267,29 +341,61 @@ export default async function handler(
         });
       }
 
-      if (response.orderID) {
+      // Check for order ID in various possible fields
+      const orderId = response?.orderID || response?.order_id || response?.id || response?.orderId;
+      
+      if (orderId) {
         console.log('[Orders API] Order created successfully:', {
-          orderId: response.orderID,
+          orderId: orderId,
           tokenId,
           side,
           orderType: isMarketOrder ? 'MARKET (FOK)' : 'LIMIT (GTC)',
+          responseStructure: Object.keys(response || {}),
         });
 
         res.setHeader('Access-Control-Allow-Origin', '*');
         return res.status(200).json({
           success: true,
-          orderId: response.orderID,
+          orderId: orderId,
         });
       } else {
-        console.error('[Orders API] Order submission failed - no order ID returned');
+        // Log the full response for debugging
+        console.error('[Orders API] Order submission failed - no order ID returned:', {
+          response: response,
+          responseType: typeof response,
+          responseKeys: response ? Object.keys(response) : 'null',
+          responseStringified: JSON.stringify(response, null, 2),
+          tokenId,
+          side,
+          isMarketOrder,
+        });
+        
         return res.status(500).json({
           error: 'Order submission failed - no order ID returned',
+          details: response ? `Response received but no order ID found. Response keys: ${Object.keys(response).join(', ')}` : 'No response received',
         });
       }
-    } catch (error) {
-      console.error('Order creation error:', error);
+    } catch (error: any) {
+      console.error('[Orders API] Order creation error:', {
+        error: error,
+        message: error instanceof Error ? error.message : 'Unknown error',
+        status: error?.response?.status || error?.status,
+        statusText: error?.response?.statusText || error?.statusText,
+        isCloudflareBlock: error?.response?.status === 403 || error?.status === 403,
+      });
+      
+      // Check for Cloudflare block
+      if (error?.response?.status === 403 || error?.status === 403) {
+        return res.status(503).json({
+          error: 'Service temporarily unavailable',
+          details: 'Request blocked by Cloudflare protection. This may be due to rate limiting or bot detection. Please try again in a few moments.',
+          retryAfter: 60, // Suggest retry after 60 seconds
+        });
+      }
+      
       return res.status(500).json({
         error: error instanceof Error ? error.message : 'Failed to create order',
+        details: error?.response?.data ? (typeof error.response.data === 'string' ? error.response.data.substring(0, 200) : JSON.stringify(error.response.data).substring(0, 200)) : undefined,
       });
     }
   }

@@ -1,6 +1,7 @@
 import type { StrategyConfig, Trade, TradingStatus } from './trading-types';
 import { CLOBClientWrapper } from './clob-client';
 import type { EventDisplayData } from './event-manager';
+import type { ClobClient } from '@polymarket/clob-client';
 
 /**
  * Converts Polymarket price from decimal (0-1) to percentage (0-100)
@@ -11,6 +12,7 @@ function toPercentage(price: number): number {
 
 export class TradingManager {
   private clobClient: CLOBClientWrapper;
+  private browserClobClient: ClobClient | null = null; // Browser ClobClient for order placement (bypasses Cloudflare)
   private strategyConfig: StrategyConfig;
   private trades: Trade[] = [];
   private status: TradingStatus;
@@ -101,6 +103,18 @@ export class TradingManager {
    */
   setApiCredentials(credentials: { key: string; secret: string; passphrase: string } | null): void {
     this.apiCredentials = credentials;
+  }
+
+  /**
+   * Set browser ClobClient for client-side order placement (bypasses Cloudflare)
+   */
+  setBrowserClobClient(clobClient: ClobClient | null): void {
+    this.browserClobClient = clobClient;
+    if (clobClient) {
+      console.log('[TradingManager] Browser ClobClient set - orders will be placed from browser (bypasses Cloudflare)');
+    } else {
+      console.log('[TradingManager] Browser ClobClient cleared - will fall back to server-side API');
+    }
   }
 
   /**
@@ -252,83 +266,167 @@ export class TradingManager {
             direction,
             entryPrice,
             tradeSize: this.strategyConfig.tradeSize,
+            usingBrowserClient: !!this.browserClobClient,
           });
 
-          // For market orders, we need to get the current ask price to calculate shares
-          // The API expects shares for BUY market orders, then calculates dollar amount internally
-          const askPrice = await this.clobClient.getPrice(tokenId, 'SELL'); // Get ask price
-          
-          if (!askPrice) {
-            throw new Error('Unable to get current market price');
-          }
-
-          if (isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
-            throw new Error('Invalid market price');
-          }
-
-          // Calculate number of shares from dollar amount
-          // shares = dollarAmount / price
-          // For example: $50 / 0.96 = 52.08 shares
-          const shares = this.strategyConfig.tradeSize / askPrice;
-
-          console.log('[TradingManager] Market order details:', {
-            askPrice: askPrice.toFixed(4),
-            askPricePercent: toPercentage(askPrice).toFixed(2),
-            tradeSizeUSD: this.strategyConfig.tradeSize,
-            shares: shares.toFixed(2),
-          });
-
-          const response = await fetch('/api/orders', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              tokenId,
-              size: shares, // Number of shares for BUY market orders
-              side: 'BUY',
-              isMarketOrder: true, // Fill or Kill market order with builder attribution
-              apiCredentials: this.apiCredentials,
-              negRisk: false,
-            }),
-          });
-
-          const data = await response.json();
-
-          if (response.ok && data.orderId) {
-            trade.status = 'filled';
-            trade.transactionHash = data.orderId;
-            trade.price = toPercentage(askPrice); // Actual fill price
-            trade.reason = `Real market order (FOK) filled: ${data.orderId} at ${trade.price.toFixed(2)} (${direction})`;
+          // Prefer browser ClobClient (bypasses Cloudflare) over server-side API
+          if (this.browserClobClient) {
+            // Use browser ClobClient - requests come from user's IP, not serverless function IP
+            console.log('[TradingManager] Using browser ClobClient (bypasses Cloudflare)');
             
-            console.log('[TradingManager] ✅ Market order (FOK) placed successfully:', {
-              orderId: data.orderId,
-              tokenId,
-              direction,
-              fillPrice: trade.price.toFixed(2),
-              tradeSize: this.strategyConfig.tradeSize,
-              builderAttribution: 'enabled',
-            });
+            const { OrderType, Side } = await import('@polymarket/clob-client');
+            const askPriceResponse = await this.browserClobClient.getPrice(tokenId, Side.SELL);
+            const askPrice = parseFloat(askPriceResponse.price);
             
-            // Create position immediately since market order is filled
-            this.status.currentPosition = {
-              eventSlug: trade.eventSlug,
-              tokenId: trade.tokenId,
-              side: trade.side,
-              size: this.strategyConfig.tradeSize,
-              entryPrice: trade.price,
+            if (isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
+              throw new Error('Invalid market price');
+            }
+
+            // Get fee rate
+            let feeRateBps: number;
+            try {
+              feeRateBps = await this.browserClobClient.getFeeRateBps(tokenId);
+              if (!feeRateBps || feeRateBps === 0) {
+                feeRateBps = 1000;
+              }
+            } catch (error) {
+              console.warn('[TradingManager] Failed to fetch fee rate, using default 1000');
+              feeRateBps = 1000;
+            }
+
+            // Calculate market amount (dollar amount for BUY orders)
+            const marketAmount = this.strategyConfig.tradeSize;
+
+            const marketOrder = {
+              tokenID: tokenId,
+              amount: marketAmount,
+              side: Side.BUY,
+              feeRateBps: feeRateBps,
             };
-            
-            this.status.successfulTrades++;
-          } else {
-            trade.status = 'failed';
-            trade.reason = `Market order failed: ${data.error || 'Unknown error'}`;
-            console.error('[TradingManager] ❌ Market order placement failed:', {
-              error: data.error,
-              tokenId,
-              direction,
+
+            console.log('[TradingManager] Browser market order details:', {
+              askPrice: askPrice.toFixed(4),
+              askPricePercent: toPercentage(askPrice).toFixed(2),
+              tradeSizeUSD: this.strategyConfig.tradeSize,
+              marketAmount: marketAmount.toFixed(2),
             });
-            this.status.failedTrades++;
+
+            const response = await this.browserClobClient.createAndPostMarketOrder(
+              marketOrder,
+              { negRisk: false },
+              OrderType.FOK
+            );
+
+            if (response?.orderID) {
+              trade.status = 'filled';
+              trade.transactionHash = response.orderID;
+              trade.price = toPercentage(askPrice);
+              trade.reason = `Browser market order (FOK) filled: ${response.orderID} at ${trade.price.toFixed(2)} (${direction})`;
+              
+              console.log('[TradingManager] ✅ Browser market order (FOK) placed successfully:', {
+                orderId: response.orderID,
+                tokenId,
+                direction,
+                fillPrice: trade.price.toFixed(2),
+                tradeSize: this.strategyConfig.tradeSize,
+                builderAttribution: 'enabled',
+                source: 'browser (bypasses Cloudflare)',
+              });
+              
+              // Create position immediately since market order is filled
+              this.status.currentPosition = {
+                eventSlug: trade.eventSlug,
+                tokenId: trade.tokenId,
+                side: trade.side,
+                size: this.strategyConfig.tradeSize,
+                entryPrice: trade.price,
+              };
+              
+              this.status.successfulTrades++;
+            } else {
+              throw new Error('Order submission failed - no order ID returned');
+            }
+          } else {
+            // Fallback to server-side API (may be blocked by Cloudflare)
+            console.log('[TradingManager] Using server-side API (may be blocked by Cloudflare)');
+            
+            // For market orders, we need to get the current ask price to calculate shares
+            // The API expects shares for BUY market orders, then calculates dollar amount internally
+            const askPrice = await this.clobClient.getPrice(tokenId, 'SELL'); // Get ask price
+            
+            if (!askPrice) {
+              throw new Error('Unable to get current market price');
+            }
+
+            if (isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
+              throw new Error('Invalid market price');
+            }
+
+            // Calculate number of shares from dollar amount
+            // shares = dollarAmount / price
+            // For example: $50 / 0.96 = 52.08 shares
+            const shares = this.strategyConfig.tradeSize / askPrice;
+
+            console.log('[TradingManager] Market order details:', {
+              askPrice: askPrice.toFixed(4),
+              askPricePercent: toPercentage(askPrice).toFixed(2),
+              tradeSizeUSD: this.strategyConfig.tradeSize,
+              shares: shares.toFixed(2),
+            });
+
+            const response = await fetch('/api/orders', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                tokenId,
+                size: shares, // Number of shares for BUY market orders
+                side: 'BUY',
+                isMarketOrder: true, // Fill or Kill market order with builder attribution
+                apiCredentials: this.apiCredentials,
+                negRisk: false,
+              }),
+            });
+
+            const data = await response.json();
+
+            if (response.ok && data.orderId) {
+              trade.status = 'filled';
+              trade.transactionHash = data.orderId;
+              trade.price = toPercentage(askPrice); // Actual fill price
+              trade.reason = `Real market order (FOK) filled: ${data.orderId} at ${trade.price.toFixed(2)} (${direction})`;
+              
+              console.log('[TradingManager] ✅ Market order (FOK) placed successfully:', {
+                orderId: data.orderId,
+                tokenId,
+                direction,
+                fillPrice: trade.price.toFixed(2),
+                tradeSize: this.strategyConfig.tradeSize,
+                builderAttribution: 'enabled',
+                source: 'server-side API',
+              });
+              
+              // Create position immediately since market order is filled
+              this.status.currentPosition = {
+                eventSlug: trade.eventSlug,
+                tokenId: trade.tokenId,
+                side: trade.side,
+                size: this.strategyConfig.tradeSize,
+                entryPrice: trade.price,
+              };
+              
+              this.status.successfulTrades++;
+            } else {
+              trade.status = 'failed';
+              trade.reason = `Market order failed: ${data.error || 'Unknown error'}`;
+              console.error('[TradingManager] ❌ Market order placement failed:', {
+                error: data.error,
+                tokenId,
+                direction,
+              });
+              this.status.failedTrades++;
+            }
           }
         } catch (apiError) {
           console.error('[TradingManager] ❌ Error placing real market order:', {
