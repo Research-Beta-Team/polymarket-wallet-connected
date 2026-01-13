@@ -198,13 +198,13 @@ export class TradingManager {
   }
 
   /**
-   * Check both UP and DOWN tokens and place market order (Fill or Kill) when price is within entry range
-   * Order is filled when UP or DOWN value is >= entryPrice and <= (entryPrice + 1)
+   * Check both UP and DOWN tokens and place market order when price equals entry price
+   * Order is filled when UP or DOWN value exactly equals entryPrice
    */
   private async checkAndPlaceMarketOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
       const entryPrice = this.strategyConfig.entryPrice;
-      const entryPriceMax = entryPrice + 1; // Maximum entry price (entryPrice + 1)
+      const priceTolerance = 0.1; // Small tolerance for floating point comparison
 
       // Get current market prices for both tokens
       const [yesPrice, noPrice] = await Promise.all([
@@ -220,23 +220,22 @@ export class TradingManager {
       const yesPricePercent = toPercentage(yesPrice);
       const noPricePercent = toPercentage(noPrice);
 
-      // Check if either token price is within entry range: >= entryPrice AND <= (entryPrice + 1)
+      // Check if either token price exactly equals entry price (with small tolerance)
       let tokenToTrade: string | null = null;
       let direction: 'UP' | 'DOWN' | null = null;
 
-      // Check UP token first (YES token)
-      if (yesPricePercent >= entryPrice && yesPricePercent <= entryPriceMax) {
+      // Check UP token first (YES token) - exact match
+      if (Math.abs(yesPricePercent - entryPrice) <= priceTolerance) {
         tokenToTrade = yesTokenId;
         direction = 'UP';
       }
-      // Check DOWN token (NO token) - only if UP token hasn't reached entry range
-      else if (noPricePercent >= entryPrice && noPricePercent <= entryPriceMax) {
+      // Check DOWN token (NO token) - exact match, only if UP token hasn't matched
+      else if (Math.abs(noPricePercent - entryPrice) <= priceTolerance) {
         tokenToTrade = noTokenId;
         direction = 'DOWN';
       }
 
-      // Place market order (Fill or Kill) when price is within entry range
-      // This ensures immediate execution with builder attribution
+      // Place market order when price exactly equals entry price
       if (tokenToTrade && direction) {
         await this.placeMarketOrder(tokenToTrade, entryPrice, direction);
       }
@@ -270,6 +269,7 @@ export class TradingManager {
         status: 'pending',
         reason: `Market order (FAK) placed at ${entryPrice.toFixed(2)} (${direction})`,
         orderType: 'MARKET',
+        direction: direction, // Set direction (UP or DOWN)
       };
 
       // If API credentials are available, place real market order with builder attribution
@@ -354,6 +354,7 @@ export class TradingManager {
                 side: trade.side,
                 size: this.strategyConfig.tradeSize,
                 entryPrice: trade.price,
+                direction: direction, // Store direction in position
               };
               
               this.status.successfulTrades++;
@@ -428,6 +429,7 @@ export class TradingManager {
                 side: trade.side,
                 size: this.strategyConfig.tradeSize,
                 entryPrice: trade.price,
+                direction: direction, // Store direction in position
               };
               
               this.status.successfulTrades++;
@@ -467,6 +469,7 @@ export class TradingManager {
           side: trade.side,
           size: this.strategyConfig.tradeSize,
           entryPrice: entryPrice,
+          direction: direction, // Store direction in position
         };
         
         this.status.successfulTrades++;
@@ -547,9 +550,9 @@ export class TradingManager {
   }
 
   /**
-   * Check exit conditions: profit target and stop loss with range-based triggers
-   * Stop Loss: Sell when price is >= (stopLoss - 1) AND <= stopLoss
-   * Profit Target: Sell when price is >= (profitTarget - 1) AND <= profitTarget
+   * Check exit conditions: profit target and stop loss
+   * Profit Target: Sell when UP or DOWN value exactly equals profit target
+   * Stop Loss: Sell when UP or DOWN value >= stop loss (with adaptive selling)
    */
   private async checkExitConditions(tokenId: string): Promise<void> {
     if (!this.status.currentPosition) {
@@ -573,12 +576,7 @@ export class TradingManager {
       const entryPrice = this.status.currentPosition.entryPrice;
       const profitTarget = this.strategyConfig.profitTargetPrice;
       const stopLoss = this.strategyConfig.stopLossPrice;
-
-      // Define exit ranges
-      const stopLossMin = stopLoss - 1; // Minimum stop loss price
-      const stopLossMax = stopLoss; // Maximum stop loss price
-      const profitTargetMin = profitTarget ; // Minimum profit target price
-      const profitTargetMax = profitTarget + 1; // Maximum profit target price
+      const priceTolerance = 0.1; // Small tolerance for floating point comparison
 
       // Update current position
       this.status.currentPosition.currentPrice = currentPricePercent;
@@ -589,13 +587,13 @@ export class TradingManager {
       const unrealizedProfit = (priceDiff / entryPrice) * this.status.currentPosition.size * 100; // Percentage-based P/L
       this.status.currentPosition.unrealizedProfit = unrealizedProfit;
 
-      // Check profit target: price is >= (profitTarget - 1) AND <= profitTarget
-      if (currentPricePercent >= profitTargetMin && currentPricePercent <= profitTargetMax) {
-        await this.closePosition(`Profit target reached at ${currentPricePercent.toFixed(2)} (range: ${profitTargetMin}-${profitTargetMax})`);
+      // Check profit target: price exactly equals profit target
+      if (Math.abs(currentPricePercent - profitTarget) <= priceTolerance) {
+        await this.closePosition(`Profit target reached at ${currentPricePercent.toFixed(2)}`);
       }
-      // Check stop loss: price is >= (stopLoss - 1) AND <= stopLoss
-      else if (currentPricePercent >= stopLossMin && currentPricePercent <= stopLossMax) {
-        await this.closePosition(`Stop loss triggered at ${currentPricePercent.toFixed(2)} (range: ${stopLossMin}-${stopLossMax})`);
+      // Check stop loss: price >= stop loss (with adaptive selling)
+      else if (currentPricePercent >= stopLoss) {
+        await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${currentPricePercent.toFixed(2)}`, stopLoss);
       }
 
       this.notifyStatusUpdate();
@@ -605,9 +603,89 @@ export class TradingManager {
   }
 
   /**
+   * Close position with adaptive selling for stop loss
+   * Tries to sell at stop loss price, then progressively lower prices if needed
+   * Example: If stop loss is 90 and current price is 95, try to sell at 90, then 89, then 88, etc.
+   */
+  private async closePositionWithAdaptiveSelling(reason: string, stopLossPrice: number): Promise<void> {
+    if (!this.status.currentPosition) {
+      return;
+    }
+
+    // Prevent multiple simultaneous exit orders
+    if (this.isPlacingOrder) {
+      console.log('[TradingManager] Exit order already being placed, skipping...');
+      return;
+    }
+
+    this.isPlacingOrder = true;
+
+    try {
+      const position = this.status.currentPosition;
+      const maxAttempts = 5; // Try up to 5 different prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
+      
+      console.log('[TradingManager] Starting adaptive stop loss selling:', {
+        stopLossPrice,
+        maxAttempts,
+        reason,
+      });
+
+      // Try selling at progressively lower prices if stop loss price can't be filled
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const targetPrice = stopLossPrice - attempt; // stopLoss, stopLoss-1, stopLoss-2, etc.
+        
+        if (targetPrice < 0) {
+          console.warn('[TradingManager] Target price went negative, using market price');
+          // Fall back to regular close position with current market price
+          this.isPlacingOrder = false;
+          await this.closePosition(reason);
+          return;
+        }
+
+        try {
+          console.log(`[TradingManager] Attempt ${attempt + 1}/${maxAttempts}: Trying to sell at price ${targetPrice.toFixed(2)}`);
+          
+          // Get current market price
+          const currentMarketPrice = await this.clobClient.getPrice(position.tokenId, 'SELL');
+          if (!currentMarketPrice) {
+            throw new Error('Could not get market price');
+          }
+
+          const currentPricePercent = toPercentage(currentMarketPrice);
+          
+          // If current price is at or below target price, we can sell
+          if (currentPricePercent <= targetPrice) {
+            console.log(`[TradingManager] Current price ${currentPricePercent.toFixed(2)} is at/below target ${targetPrice.toFixed(2)}, proceeding with sale`);
+            this.isPlacingOrder = false;
+            await this.closePosition(`${reason} - Sold at ${currentPricePercent.toFixed(2)} (target was ${targetPrice.toFixed(2)})`);
+            return;
+          } else {
+            console.log(`[TradingManager] Current price ${currentPricePercent.toFixed(2)} is above target ${targetPrice.toFixed(2)}, will try lower price on next attempt`);
+            // Wait a bit before next attempt
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        } catch (error) {
+          console.error(`[TradingManager] Error on attempt ${attempt + 1}:`, error);
+          // Continue to next attempt
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+
+      // If all attempts failed, try to sell at current market price anyway
+      console.warn('[TradingManager] All adaptive attempts failed, selling at current market price');
+      this.isPlacingOrder = false;
+      await this.closePosition(`${reason} - Adaptive selling failed, using market price`);
+    } catch (error) {
+      console.error('[TradingManager] Error in adaptive selling:', error);
+      this.isPlacingOrder = false;
+      // Fall back to regular close position
+      await this.closePosition(reason);
+    }
+  }
+
+  /**
    * Close current position with market order
    * Uses API if credentials are available, otherwise simulates
-   * Sells maximum shares within the exit price range
    */
   private async closePosition(reason: string): Promise<void> {
     if (!this.status.currentPosition) {
@@ -656,6 +734,7 @@ export class TradingManager {
         profit,
         reason: `Exit: ${reason}`,
         orderType: 'MARKET',
+        direction: position.direction, // Preserve direction from position
       };
 
       // If API credentials are available, place real market order

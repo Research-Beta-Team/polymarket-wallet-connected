@@ -1112,6 +1112,27 @@ header h1 {
   display: inline-block;
 }
 
+.direction-badge {
+  margin-left: 6px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 0.85rem;
+  display: inline-block;
+}
+
+.direction-badge.direction-up {
+  color: #28a745;
+  background: #d4edda;
+  border: 1px solid #28a745;
+}
+
+.direction-badge.direction-down {
+  color: #dc3545;
+  background: #f8d7da;
+  border: 1px solid #dc3545;
+}
+
 .status-badge {
   padding: 4px 8px;
   border-radius: 4px;
