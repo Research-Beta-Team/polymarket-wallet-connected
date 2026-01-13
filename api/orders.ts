@@ -112,6 +112,21 @@ export default async function handler(
       } else if (tokenId && size !== undefined && side) {
         const orderSide = side === 'BUY' ? Side.BUY : Side.SELL;
 
+        // Fetch fee rate for the token
+        let feeRateBps: number;
+        try {
+          feeRateBps = await clobClient.getFeeRateBps(tokenId);
+          // Ensure fee rate is valid (default to 1000 if 0 or invalid)
+          if (!feeRateBps || feeRateBps === 0) {
+            console.warn(`Fee rate for token ${tokenId} is 0, using default 1000`);
+            feeRateBps = 1000; // Default fee rate
+          }
+          console.log(`Using fee rate ${feeRateBps} for token ${tokenId}`);
+        } catch (error) {
+          console.warn('Failed to fetch fee rate, using default 1000:', error);
+          feeRateBps = 1000; // Default fee rate
+        }
+
         if (isMarketOrder) {
           // Market order (Fill or Kill)
           let marketAmount: number;
@@ -135,7 +150,7 @@ export default async function handler(
             tokenID: tokenId,
             amount: marketAmount,
             side: orderSide,
-            feeRateBps: 0,
+            feeRateBps: feeRateBps,
           };
 
           response = await clobClient.createAndPostMarketOrder(
@@ -156,7 +171,7 @@ export default async function handler(
             price: price,
             size: size,
             side: orderSide,
-            feeRateBps: 0,
+            feeRateBps: feeRateBps,
             expiration: 0,
             taker: '0x0000000000000000000000000000000000000000',
           };
