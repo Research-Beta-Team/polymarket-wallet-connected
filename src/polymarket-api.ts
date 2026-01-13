@@ -267,6 +267,7 @@ export class PolymarketAPI {
         clobTokenIds: extractedClobTokenIds as string[], // Ensure it's an array, not string
         liquidity: data.liquidity,
         volume: data.volume,
+        markets: data.markets, // IMPORTANT: Preserve markets data for fallback extraction
         ...data // Include any other fields for debugging
       };
       
@@ -275,6 +276,10 @@ export class PolymarketAPI {
       event.questionId = extractedQuestionId;
       event.questionID = extractedQuestionId;
       event.clobTokenIds = extractedClobTokenIds as string[];
+      // Ensure markets is preserved (spread might overwrite it)
+      if (data.markets) {
+        event.markets = data.markets;
+      }
       
       console.log(`[PolymarketAPI] Final event data for ${slug}:`, {
         conditionId: event.conditionId || 'MISSING',
@@ -284,7 +289,18 @@ export class PolymarketAPI {
         clobTokenIdsType: typeof event.clobTokenIds,
         clobTokenIdsIsArray: Array.isArray(event.clobTokenIds),
         clobTokenIdsLength: Array.isArray(event.clobTokenIds) ? event.clobTokenIds.length : 0,
+        // Also check if markets data is preserved
+        hasMarkets: !!event.markets,
+        marketsLength: event.markets?.length || 0,
+        market0ClobTokenIds: event.markets?.[0]?.clobTokenIds || 'MISSING',
+        market0Tokens: event.markets?.[0]?.tokens?.length || 0,
       });
+      
+      // Ensure markets data is preserved in the event object for fallback extraction
+      if (data.markets && !event.markets) {
+        event.markets = data.markets;
+        console.log(`[PolymarketAPI] Preserved markets data in event object for ${slug}`);
+      }
       
       return event;
     } catch (error) {

@@ -62,29 +62,94 @@ export class EventManager {
     let questionId = event?.questionID || event?.questionId || event?.question_id; // API uses questionID
     let clobTokenIds: string[] | undefined = undefined;
     
+    // Debug: Log the full event object to see what we received
+    console.log(`[EventManager] Event received for ${slug}:`, {
+      hasEvent: !!event,
+      eventKeys: event ? Object.keys(event) : [],
+      conditionId: event?.conditionId || event?.condition_id || 'MISSING',
+      questionId: event?.questionID || event?.questionId || event?.question_id || 'MISSING',
+      clobTokenIds: event?.clobTokenIds || 'MISSING',
+      clobTokenIdsType: typeof event?.clobTokenIds,
+      hasMarkets: !!event?.markets,
+      marketsLength: event?.markets?.length || 0,
+      market0ClobTokenIds: event?.markets?.[0]?.clobTokenIds || 'MISSING',
+      market0Tokens: event?.markets?.[0]?.tokens?.length || 0,
+      // Log full event structure (first 1000 chars)
+      fullEventSample: event ? JSON.stringify(event, null, 2).substring(0, 1000) : 'null',
+    });
+    
     // Get clobTokenIds from event - it should already be parsed by API layer
     if (event?.clobTokenIds) {
       if (Array.isArray(event.clobTokenIds)) {
         clobTokenIds = event.clobTokenIds;
+        console.log(`[EventManager] ✓ Found clobTokenIds in event.clobTokenIds:`, clobTokenIds);
       } else if (typeof event.clobTokenIds === 'string') {
         // Fallback: parse if still a string (shouldn't happen but just in case)
         try {
           const parsed = JSON.parse(event.clobTokenIds);
           if (Array.isArray(parsed)) {
             clobTokenIds = parsed;
+            console.log(`[EventManager] ✓ Parsed clobTokenIds from string:`, clobTokenIds);
           }
         } catch (e) {
-          console.warn('Failed to parse clobTokenIds as JSON in event-manager:', e);
+          console.warn('[EventManager] Failed to parse clobTokenIds as JSON:', e);
+        }
+      }
+    } else if (event?.markets?.[0]) {
+      // Fallback: Try to extract from markets if not already extracted
+      const market = event.markets[0];
+      console.log(`[EventManager] Trying fallback extraction from markets[0] for ${slug}`);
+      
+      // Try clobTokenIds in market
+      if (market.clobTokenIds) {
+        if (Array.isArray(market.clobTokenIds)) {
+          clobTokenIds = market.clobTokenIds;
+          console.log(`[EventManager] ✓ Found clobTokenIds in markets[0].clobTokenIds:`, clobTokenIds);
+        } else if (typeof market.clobTokenIds === 'string') {
+          try {
+            const parsed = JSON.parse(market.clobTokenIds);
+            if (Array.isArray(parsed)) {
+              clobTokenIds = parsed;
+              console.log(`[EventManager] ✓ Found clobTokenIds in markets[0].clobTokenIds (parsed):`, clobTokenIds);
+            }
+          } catch (e) {
+            console.warn('[EventManager] Failed to parse markets[0].clobTokenIds:', e);
+          }
+        }
+      }
+      
+      // Try tokens array
+      if (!clobTokenIds && market.tokens && Array.isArray(market.tokens) && market.tokens.length > 0) {
+        const tokenIds = market.tokens
+          .map((t: any) => t.token_id || t.tokenId || t.id || t.clobTokenId)
+          .filter(Boolean);
+        if (tokenIds.length > 0) {
+          clobTokenIds = tokenIds;
+          console.log(`[EventManager] ✓ Found clobTokenIds in markets[0].tokens:`, clobTokenIds);
+        }
+      }
+      
+      // Try to extract conditionId and questionId from market if missing
+      if (!conditionId) {
+        conditionId = market.conditionId || market.condition_id;
+        if (conditionId) {
+          console.log(`[EventManager] ✓ Found conditionId in markets[0]:`, conditionId);
+        }
+      }
+      if (!questionId) {
+        questionId = market.questionID || market.questionId || market.question_id;
+        if (questionId) {
+          console.log(`[EventManager] ✓ Found questionId in markets[0]:`, questionId);
         }
       }
     }
     
     // Debug logging
-    console.log(`Event ${slug} - clobTokenIds:`, {
-      raw: event?.clobTokenIds,
-      type: typeof event?.clobTokenIds,
-      isArray: Array.isArray(event?.clobTokenIds),
-      parsed: clobTokenIds
+    console.log(`[EventManager] Final extraction for ${slug}:`, {
+      conditionId: conditionId || 'MISSING',
+      questionId: questionId || 'MISSING',
+      clobTokenIds: clobTokenIds || 'MISSING',
+      clobTokenIdsCount: clobTokenIds?.length || 0,
     });
     
     return {
