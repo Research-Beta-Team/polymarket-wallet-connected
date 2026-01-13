@@ -24,6 +24,7 @@ export class TradingManager {
   private currentPrice: number | null = null; // Current BTC/USD price
   private priceToBeat: number | null = null; // Price to Beat for active event
   private apiCredentials: { key: string; secret: string; passphrase: string } | null = null; // API credentials for order placement
+  private isPlacingOrder: boolean = false; // Flag to prevent multiple simultaneous orders
 
   constructor() {
     this.clobClient = new CLOBClientWrapper();
@@ -174,8 +175,13 @@ export class TradingManager {
       return;
     }
 
+    // Prevent multiple simultaneous orders
+    if (this.isPlacingOrder) {
+      return;
+    }
+
     // Check pending limit orders for both tokens (legacy support - market orders are immediate)
-    // Note: Market orders (FOK) execute immediately, so we don't need to check for pending orders
+    // Note: Market orders (FAK) execute immediately, so we don't need to check for pending orders
     // This check is kept for backward compatibility with any existing pending limit orders
     if (this.pendingLimitOrders.has(yesTokenId)) {
       await this.checkLimitOrderFill(yesTokenId);
@@ -192,12 +198,13 @@ export class TradingManager {
   }
 
   /**
-   * Check both UP and DOWN tokens and place market order (Fill or Kill) when price is equal or greater than entry price
-   * Order is filled immediately when UP or DOWN value is >= entry price using FOK (Fill or Kill) market order
+   * Check both UP and DOWN tokens and place market order (Fill or Kill) when price is within entry range
+   * Order is filled when UP or DOWN value is >= entryPrice and <= (entryPrice + 1)
    */
   private async checkAndPlaceMarketOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
       const entryPrice = this.strategyConfig.entryPrice;
+      const entryPriceMax = entryPrice + 1; // Maximum entry price (entryPrice + 1)
 
       // Get current market prices for both tokens
       const [yesPrice, noPrice] = await Promise.all([
@@ -213,23 +220,22 @@ export class TradingManager {
       const yesPricePercent = toPercentage(yesPrice);
       const noPricePercent = toPercentage(noPrice);
 
-      // Check if either token price is equal or greater than entry price
-      // Order is filled when UP or DOWN value is >= entry price
+      // Check if either token price is within entry range: >= entryPrice AND <= (entryPrice + 1)
       let tokenToTrade: string | null = null;
       let direction: 'UP' | 'DOWN' | null = null;
 
       // Check UP token first (YES token)
-      if (yesPricePercent >= entryPrice) {
+      if (yesPricePercent >= entryPrice && yesPricePercent <= entryPriceMax) {
         tokenToTrade = yesTokenId;
         direction = 'UP';
       }
-      // Check DOWN token (NO token) - only if UP token hasn't reached entry price
-      else if (noPricePercent >= entryPrice) {
+      // Check DOWN token (NO token) - only if UP token hasn't reached entry range
+      else if (noPricePercent >= entryPrice && noPricePercent <= entryPriceMax) {
         tokenToTrade = noTokenId;
         direction = 'DOWN';
       }
 
-      // Place market order (Fill or Kill) when price is equal or greater than entry price
+      // Place market order (Fill or Kill) when price is within entry range
       // This ensures immediate execution with builder attribution
       if (tokenToTrade && direction) {
         await this.placeMarketOrder(tokenToTrade, entryPrice, direction);
@@ -244,6 +250,14 @@ export class TradingManager {
    * Uses builder attribution via remote signing through /api/orders endpoint
    */
   private async placeMarketOrder(tokenId: string, entryPrice: number, direction: 'UP' | 'DOWN'): Promise<void> {
+    // Prevent multiple simultaneous orders
+    if (this.isPlacingOrder) {
+      console.log('[TradingManager] Order already being placed, skipping...');
+      return;
+    }
+
+    this.isPlacingOrder = true;
+
     try {
       const trade: Trade = {
         id: `market-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
@@ -254,14 +268,14 @@ export class TradingManager {
         price: entryPrice,
         timestamp: Date.now(),
         status: 'pending',
-        reason: `Market order (FOK) placed at ${entryPrice.toFixed(2)} (${direction})`,
+        reason: `Market order (FAK) placed at ${entryPrice.toFixed(2)} (${direction})`,
         orderType: 'MARKET',
       };
 
       // If API credentials are available, place real market order with builder attribution
       if (this.apiCredentials) {
         try {
-          console.log('[TradingManager] Placing market order (FOK):', {
+          console.log('[TradingManager] Placing market order (FAK):', {
             tokenId,
             direction,
             entryPrice,
@@ -314,16 +328,16 @@ export class TradingManager {
             const response = await this.browserClobClient.createAndPostMarketOrder(
               marketOrder,
               { negRisk: false },
-              OrderType.FOK
+              OrderType.FAK
             );
 
             if (response?.orderID) {
               trade.status = 'filled';
               trade.transactionHash = response.orderID;
               trade.price = toPercentage(askPrice);
-              trade.reason = `Browser market order (FOK) filled: ${response.orderID} at ${trade.price.toFixed(2)} (${direction})`;
+              trade.reason = `Browser market order (FAK) filled: ${response.orderID} at ${trade.price.toFixed(2)} (${direction})`;
               
-              console.log('[TradingManager] ✅ Browser market order (FOK) placed successfully:', {
+              console.log('[TradingManager] ✅ Browser market order (FAK) placed successfully:', {
                 orderId: response.orderID,
                 tokenId,
                 direction,
@@ -395,9 +409,9 @@ export class TradingManager {
               trade.status = 'filled';
               trade.transactionHash = data.orderId;
               trade.price = toPercentage(askPrice); // Actual fill price
-              trade.reason = `Real market order (FOK) filled: ${data.orderId} at ${trade.price.toFixed(2)} (${direction})`;
+              trade.reason = `Real market order (FAK) filled: ${data.orderId} at ${trade.price.toFixed(2)} (${direction})`;
               
-              console.log('[TradingManager] ✅ Market order (FOK) placed successfully:', {
+              console.log('[TradingManager] ✅ Market order (FAK) placed successfully:', {
                 orderId: data.orderId,
                 tokenId,
                 direction,
@@ -443,8 +457,8 @@ export class TradingManager {
         // Simulation mode - treat as filled immediately for market orders
         trade.status = 'filled';
         trade.transactionHash = `0x${Math.random().toString(16).substr(2, 64)}`;
-        trade.reason = `Simulated market order (FOK) filled at ${entryPrice.toFixed(2)} (${direction})`;
-        console.log(`Simulated market order (FOK) placed: ${trade.id} at ${entryPrice.toFixed(2)}`);
+        trade.reason = `Simulated market order (FAK) filled at ${entryPrice.toFixed(2)} (${direction})`;
+        console.log(`Simulated market order (FAK) placed: ${trade.id} at ${entryPrice.toFixed(2)}`);
         
         // Create position for simulation
         this.status.currentPosition = {
@@ -466,6 +480,8 @@ export class TradingManager {
       this.notifyStatusUpdate();
     } catch (error) {
       console.error('Error placing market order:', error);
+    } finally {
+      this.isPlacingOrder = false;
     }
   }
 
@@ -531,10 +547,17 @@ export class TradingManager {
   }
 
   /**
-   * Check exit conditions: profit target at 100 or stop loss at 91
+   * Check exit conditions: profit target and stop loss with range-based triggers
+   * Stop Loss: Sell when price is >= (stopLoss - 1) AND <= stopLoss
+   * Profit Target: Sell when price is >= (profitTarget - 1) AND <= profitTarget
    */
   private async checkExitConditions(tokenId: string): Promise<void> {
     if (!this.status.currentPosition) {
+      return;
+    }
+
+    // Prevent multiple simultaneous exit orders
+    if (this.isPlacingOrder) {
       return;
     }
 
@@ -551,6 +574,12 @@ export class TradingManager {
       const profitTarget = this.strategyConfig.profitTargetPrice;
       const stopLoss = this.strategyConfig.stopLossPrice;
 
+      // Define exit ranges
+      const stopLossMin = stopLoss - 1; // Minimum stop loss price
+      const stopLossMax = stopLoss; // Maximum stop loss price
+      const profitTargetMin = profitTarget ; // Minimum profit target price
+      const profitTargetMax = profitTarget + 1; // Maximum profit target price
+
       // Update current position
       this.status.currentPosition.currentPrice = currentPricePercent;
       
@@ -560,13 +589,13 @@ export class TradingManager {
       const unrealizedProfit = (priceDiff / entryPrice) * this.status.currentPosition.size * 100; // Percentage-based P/L
       this.status.currentPosition.unrealizedProfit = unrealizedProfit;
 
-      // Check profit target (100)
-      if (currentPricePercent >= profitTarget) {
-        await this.closePosition(`Profit target reached at ${profitTarget}`);
+      // Check profit target: price is >= (profitTarget - 1) AND <= profitTarget
+      if (currentPricePercent >= profitTargetMin && currentPricePercent <= profitTargetMax) {
+        await this.closePosition(`Profit target reached at ${currentPricePercent.toFixed(2)} (range: ${profitTargetMin}-${profitTargetMax})`);
       }
-      // Check stop loss (91)
-      else if (currentPricePercent <= stopLoss) {
-        await this.closePosition(`Stop loss triggered at ${stopLoss}`);
+      // Check stop loss: price is >= (stopLoss - 1) AND <= stopLoss
+      else if (currentPricePercent >= stopLossMin && currentPricePercent <= stopLossMax) {
+        await this.closePosition(`Stop loss triggered at ${currentPricePercent.toFixed(2)} (range: ${stopLossMin}-${stopLossMax})`);
       }
 
       this.notifyStatusUpdate();
@@ -578,11 +607,20 @@ export class TradingManager {
   /**
    * Close current position with market order
    * Uses API if credentials are available, otherwise simulates
+   * Sells maximum shares within the exit price range
    */
   private async closePosition(reason: string): Promise<void> {
     if (!this.status.currentPosition) {
       return;
     }
+
+    // Prevent multiple simultaneous exit orders
+    if (this.isPlacingOrder) {
+      console.log('[TradingManager] Exit order already being placed, skipping...');
+      return;
+    }
+
+    this.isPlacingOrder = true;
 
     try {
       const position = this.status.currentPosition;
@@ -623,41 +661,131 @@ export class TradingManager {
       // If API credentials are available, place real market order
       if (this.apiCredentials) {
         try {
-          // Calculate shares from USD size
-          const decimalPrice = exitPricePercent / 100;
-          const shares = position.size / decimalPrice;
-
-          const response = await fetch('/api/orders', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              tokenId: position.tokenId,
-              size: shares,
-              side: 'SELL',
-              isMarketOrder: true,
-              apiCredentials: this.apiCredentials,
-              negRisk: false,
-            }),
+          console.log('[TradingManager] Closing position (SELL):', {
+            tokenId: position.tokenId,
+            size: position.size,
+            entryPrice: position.entryPrice,
+            exitPrice: exitPricePercent,
+            reason,
+            usingBrowserClient: !!this.browserClobClient,
           });
 
-          const data = await response.json();
+          // Prefer browser ClobClient (bypasses Cloudflare) over server-side API
+          if (this.browserClobClient) {
+            // Use browser ClobClient - requests come from user's IP, not serverless function IP
+            console.log('[TradingManager] Using browser ClobClient for SELL order (bypasses Cloudflare)');
+            
+            const { OrderType, Side } = await import('@polymarket/clob-client');
+            
+            // Get bid price for SELL orders
+            const bidPriceResponse = await this.browserClobClient.getPrice(position.tokenId, Side.BUY);
+            const bidPrice = parseFloat(bidPriceResponse.price);
+            
+            if (isNaN(bidPrice) || bidPrice <= 0 || bidPrice >= 1) {
+              throw new Error('Invalid market price for SELL');
+            }
 
-          if (response.ok && data.orderId) {
-            exitTrade.status = 'filled';
-            exitTrade.transactionHash = data.orderId;
-            exitTrade.reason = `Real exit order: ${data.orderId} - ${reason}`;
-            console.log(`Real exit order placed: ${data.orderId} for ${reason}`);
-            this.status.successfulTrades++;
+            // Get fee rate
+            let feeRateBps: number;
+            try {
+              feeRateBps = await this.browserClobClient.getFeeRateBps(position.tokenId);
+              if (!feeRateBps || feeRateBps === 0) {
+                feeRateBps = 1000;
+              }
+            } catch (error) {
+              console.warn('[TradingManager] Failed to fetch fee rate, using default 1000');
+              feeRateBps = 1000;
+            }
+
+            // For SELL orders, amount is in shares (not dollars)
+            // We need to calculate shares from the position size
+            // Position size is in USD, so shares = USD / price
+            const decimalPrice = bidPrice;
+            const shares = position.size / decimalPrice;
+
+            const marketOrder = {
+              tokenID: position.tokenId,
+              amount: shares, // For SELL orders, amount is in shares
+              side: Side.SELL,
+              feeRateBps: feeRateBps,
+            };
+
+            console.log('[TradingManager] Browser SELL order details:', {
+              bidPrice: bidPrice.toFixed(4),
+              bidPricePercent: toPercentage(bidPrice).toFixed(2),
+              positionSizeUSD: position.size,
+              shares: shares.toFixed(2),
+            });
+
+            const response = await this.browserClobClient.createAndPostMarketOrder(
+              marketOrder,
+              { negRisk: false },
+              OrderType.FAK
+            );
+
+            if (response?.orderID) {
+              exitTrade.status = 'filled';
+              exitTrade.transactionHash = response.orderID;
+              exitTrade.price = toPercentage(bidPrice);
+              exitTrade.reason = `Browser exit order (FAK) filled: ${response.orderID} - ${reason}`;
+              
+              console.log('[TradingManager] ✅ Browser SELL order (FAK) placed successfully:', {
+                orderId: response.orderID,
+                tokenId: position.tokenId,
+                fillPrice: exitTrade.price.toFixed(2),
+                profit: profit.toFixed(2),
+                builderAttribution: 'enabled',
+                source: 'browser (bypasses Cloudflare)',
+              });
+              
+              this.status.successfulTrades++;
+            } else {
+              throw new Error('Order submission failed - no order ID returned');
+            }
           } else {
-            exitTrade.status = 'failed';
-            exitTrade.reason = `Exit failed: ${data.error || 'Unknown error'}`;
-            console.error('Exit order placement failed:', data.error);
-            this.status.failedTrades++;
+            // Fallback to server-side API (may be blocked by Cloudflare)
+            console.log('[TradingManager] Using server-side API for SELL order (may be blocked by Cloudflare)');
+            
+            // Calculate shares from USD size
+            const decimalPrice = exitPricePercent / 100;
+            const shares = position.size / decimalPrice;
+
+            const response = await fetch('/api/orders', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                tokenId: position.tokenId,
+                size: shares,
+                side: 'SELL',
+                isMarketOrder: true,
+                apiCredentials: this.apiCredentials,
+                negRisk: false,
+              }),
+            });
+
+            const data = await response.json();
+
+            if (response.ok && data.orderId) {
+              exitTrade.status = 'filled';
+              exitTrade.transactionHash = data.orderId;
+              exitTrade.reason = `Real exit order: ${data.orderId} - ${reason}`;
+              console.log(`Real exit order placed: ${data.orderId} for ${reason}`);
+              this.status.successfulTrades++;
+            } else {
+              exitTrade.status = 'failed';
+              exitTrade.reason = `Exit failed: ${data.error || 'Unknown error'}`;
+              console.error('Exit order placement failed:', data.error);
+              this.status.failedTrades++;
+            }
           }
         } catch (apiError) {
-          console.error('Error placing real exit order:', apiError);
+          console.error('[TradingManager] ❌ Error placing real exit order:', {
+            error: apiError instanceof Error ? apiError.message : 'Unknown error',
+            tokenId: position.tokenId,
+            stack: apiError instanceof Error ? apiError.stack : undefined,
+          });
           exitTrade.status = 'failed';
           exitTrade.reason = `API error: ${apiError instanceof Error ? apiError.message : 'Unknown error'}`;
           this.status.failedTrades++;
@@ -682,6 +810,8 @@ export class TradingManager {
       this.notifyStatusUpdate();
     } catch (error) {
       console.error('Error closing position:', error);
+    } finally {
+      this.isPlacingOrder = false;
     }
   }
 

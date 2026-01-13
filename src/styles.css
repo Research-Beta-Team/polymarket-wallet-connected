@@ -963,6 +963,23 @@ header h1 {
   color: #dc3545;
 }
 
+.orders-empty-cell,
+.orders-loading-cell,
+.orders-error-cell {
+  text-align: center;
+  padding: 40px !important;
+  color: #6c757d;
+  font-style: italic;
+}
+
+.orders-loading-cell {
+  color: #667eea;
+}
+
+.orders-error-cell {
+  color: #dc3545;
+}
+
 .orders-table {
   width: 100%;
   border-collapse: collapse;

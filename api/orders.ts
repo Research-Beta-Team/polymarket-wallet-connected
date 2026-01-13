@@ -257,7 +257,7 @@ export default async function handler(
               response = await clobClient.createAndPostMarketOrder(
                 marketOrder,
                 { negRisk: negRisk ?? false },
-                OrderType.FOK
+                OrderType.FAK
               );
               
               console.log('[Orders API] Market order response:', {

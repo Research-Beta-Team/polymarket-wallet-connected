@@ -1311,7 +1311,27 @@ export class StreamingPlatform {
       const ordersContainer = document.getElementById('orders-container');
       const ordersCount = document.getElementById('orders-count');
       if (ordersContainer) {
-        ordersContainer.innerHTML = '<p class="orders-empty">Wallet not initialized. Please initialize trading session first.</p>';
+        // Show not initialized state with table structure
+        ordersContainer.innerHTML = `
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th>Order ID</th>
+                <th>Token ID</th>
+                <th>Side</th>
+                <th>Price</th>
+                <th>Size</th>
+                <th>Filled</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td colspan="9" class="orders-empty-cell">Wallet not initialized. Please initialize trading session first.</td></tr>
+            </tbody>
+          </table>
+        `;
       }
       if (ordersCount) {
         ordersCount.textContent = 'N/A';
@@ -1323,7 +1343,27 @@ export class StreamingPlatform {
     const ordersCount = document.getElementById('orders-count');
 
     if (ordersContainer) {
-      ordersContainer.innerHTML = '<p>Loading orders...</p>';
+      // Show loading state with table structure
+      ordersContainer.innerHTML = `
+        <table class="orders-table">
+          <thead>
+            <tr>
+              <th>Order ID</th>
+              <th>Token ID</th>
+              <th>Side</th>
+              <th>Price</th>
+              <th>Size</th>
+              <th>Filled</th>
+              <th>Status</th>
+              <th>Created</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td colspan="9" class="orders-loading-cell">Loading orders...</td></tr>
+          </tbody>
+        </table>
+      `;
     }
 
     try {
@@ -1346,14 +1386,7 @@ export class StreamingPlatform {
         ordersCount.textContent = `${orders.length} active`;
       }
 
-      if (orders.length === 0) {
-        if (ordersContainer) {
-          ordersContainer.innerHTML = '<p class="orders-empty">No active orders</p>';
-        }
-        return;
-      }
-
-      // Render orders table
+      // Always render orders table with headers
       if (ordersContainer) {
         ordersContainer.innerHTML = `
           <table class="orders-table">
@@ -1371,42 +1404,67 @@ export class StreamingPlatform {
               </tr>
             </thead>
             <tbody>
-              ${orders.map((order: any) => `
-                <tr class="order-row" data-order-id="${order.id}">
-                  <td class="order-id">${order.id.substring(0, 8)}...</td>
-                  <td class="token-id">${order.asset_id?.substring(0, 10)}...</td>
-                  <td><span class="side-${order.side.toLowerCase()}">${order.side}</span></td>
-                  <td>${parseFloat(order.price || 0).toFixed(4)}</td>
-                  <td>${parseFloat(order.original_size || 0).toFixed(2)}</td>
-                  <td>${parseFloat(order.size_matched || 0).toFixed(2)}</td>
-                  <td><span class="status-badge status-${order.status.toLowerCase()}">${order.status}</span></td>
-                  <td>${new Date(order.created_at * 1000).toLocaleString()}</td>
-                  <td>
-                    <button class="btn-cancel-order" data-order-id="${order.id}" ${order.status !== 'LIVE' ? 'disabled' : ''}>
-                      Cancel
-                    </button>
-                  </td>
-                </tr>
-              `).join('')}
+              ${orders.length === 0 
+                ? '<tr><td colspan="9" class="orders-empty-cell">No active orders</td></tr>'
+                : orders.map((order: any) => `
+                  <tr class="order-row" data-order-id="${order.id}">
+                    <td class="order-id">${order.id.substring(0, 8)}...</td>
+                    <td class="token-id">${order.asset_id?.substring(0, 10)}...</td>
+                    <td><span class="side-${order.side.toLowerCase()}">${order.side}</span></td>
+                    <td>${parseFloat(order.price || 0).toFixed(4)}</td>
+                    <td>${parseFloat(order.original_size || 0).toFixed(2)}</td>
+                    <td>${parseFloat(order.size_matched || 0).toFixed(2)}</td>
+                    <td><span class="status-badge status-${order.status.toLowerCase()}">${order.status}</span></td>
+                    <td>${new Date(order.created_at * 1000).toLocaleString()}</td>
+                    <td>
+                      <button class="btn-cancel-order" data-order-id="${order.id}" ${order.status !== 'LIVE' ? 'disabled' : ''}>
+                        Cancel
+                      </button>
+                    </td>
+                  </tr>
+                `).join('')
+              }
             </tbody>
           </table>
         `;
 
-        // Add event listeners for cancel buttons
-        const cancelButtons = ordersContainer.querySelectorAll('.btn-cancel-order');
-        cancelButtons.forEach(btn => {
-          btn.addEventListener('click', async (e) => {
-            const orderId = (e.target as HTMLButtonElement).getAttribute('data-order-id');
-            if (orderId) {
-              await this.cancelOrder(orderId);
-            }
+        // Add event listeners for cancel buttons (only if there are orders)
+        if (orders.length > 0) {
+          const cancelButtons = ordersContainer.querySelectorAll('.btn-cancel-order');
+          cancelButtons.forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+              const orderId = (e.target as HTMLButtonElement).getAttribute('data-order-id');
+              if (orderId) {
+                await this.cancelOrder(orderId);
+              }
+            });
           });
-        });
+        }
       }
     } catch (error) {
       console.error('[Orders] Error fetching orders:', error);
       if (ordersContainer) {
-        ordersContainer.innerHTML = `<p class="orders-error">Error loading orders: ${error instanceof Error ? error.message : 'Unknown error'}</p>`;
+        // Show error state with table structure
+        ordersContainer.innerHTML = `
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th>Order ID</th>
+                <th>Token ID</th>
+                <th>Side</th>
+                <th>Price</th>
+                <th>Size</th>
+                <th>Filled</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td colspan="9" class="orders-error-cell">Error loading orders: ${error instanceof Error ? error.message : 'Unknown error'}</td></tr>
+            </tbody>
+          </table>
+        `;
       }
       if (ordersCount) {
         ordersCount.textContent = 'Error';
