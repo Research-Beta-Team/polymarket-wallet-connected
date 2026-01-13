@@ -3,8 +3,32 @@ import { Wallet, providers } from 'ethers';
 import { ClobClient, OrderType, Side } from '@polymarket/clob-client';
 import type { UserOrder, UserMarketOrder } from '@polymarket/clob-client';
 import { BuilderConfig } from '@polymarket/builder-signing-sdk';
-import { deriveProxyAddress } from '../utils/proxyWallet';
-import { CLOB_API_URL, POLYGON_CHAIN_ID, POLYGON_RPC_URL } from '../constants/polymarket';
+import { keccak256, getCreate2Address, encodePacked } from 'viem';
+
+// Polymarket constants
+const CLOB_API_URL = 'https://clob.polymarket.com';
+const POLYGON_CHAIN_ID = 137;
+const POLYGON_RPC_URL = process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
+
+// Polymarket Polygon Proxy Contract Addresses
+const PROXY_FACTORY = '0xaB45c5A4B0c941a2F231C04C3f49182e1A254052' as const;
+const PROXY_INIT_CODE_HASH = '0xd21df8dc65880a8606f09fe0ce3df9b8869287ab0b058be05aa9e8af6330a00b' as const;
+
+/**
+ * Derive Polymarket Non-Safe Proxy Wallet address from EOA address
+ */
+function deriveProxyAddress(eoaAddress: string): string {
+  try {
+    return getCreate2Address({
+      bytecodeHash: PROXY_INIT_CODE_HASH,
+      from: PROXY_FACTORY,
+      salt: keccak256(encodePacked(['address'], [eoaAddress.toLowerCase() as `0x${string}`])),
+    });
+  } catch (error) {
+    console.error('[deriveProxyAddress] Error:', error);
+    throw new Error(`Failed to derive proxy address: ${error instanceof Error ? error.message : 'Unknown error'}`);
+  }
+}
 
 function getSigningUrl(request: VercelRequest): string {
   const host = request.headers.host || 'localhost:3000';

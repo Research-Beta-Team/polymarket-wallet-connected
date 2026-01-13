@@ -1,7 +1,11 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { Wallet, providers } from 'ethers';
 import { ClobClient } from '@polymarket/clob-client';
-import { CLOB_API_URL, POLYGON_CHAIN_ID, POLYGON_RPC_URL } from '../../constants/polymarket';
+
+// Polymarket constants
+const CLOB_API_URL = 'https://clob.polymarket.com';
+const POLYGON_CHAIN_ID = 137;
+const POLYGON_RPC_URL = process.env.POLYGON_RPC_URL || 'https://polygon-rpc.com';
 
 export default async function handler(
   req: VercelRequest,
