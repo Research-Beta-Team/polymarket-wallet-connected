@@ -25,7 +25,9 @@ export interface PolymarketEvent {
     questionId?: string;
     questionID?: string;
     question_id?: string;
-    tokens?: Array<{ token_id?: string; tokenId?: string; id?: string }>;
+    clobTokenIds?: string[] | string;
+    clob_token_ids?: string[] | string;
+    tokens?: Array<{ token_id?: string; tokenId?: string; id?: string; clobTokenId?: string }>;
   }>;
   liquidity?: number;
   volume?: number;
