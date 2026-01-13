@@ -782,27 +782,27 @@ export class StreamingPlatform {
                     Enable Strategy
                   </label>
                 </div>
-                <div class="config-item">
-                  <label>
-                    Entry Price (0-100):
-                    <input type="number" id="entry-price" value="96" min="0" max="100" step="0.01" />
-                    <small>Limit order will be placed at this price</small>
-                  </label>
-                </div>
-                <div class="config-item">
-                  <label>
-                    Profit Target (0-100):
-                    <input type="number" id="profit-target-price" value="100" min="0" max="100" step="0.01" />
-                    <small>Sell when price reaches this level</small>
-                  </label>
-                </div>
-                <div class="config-item">
-                  <label>
-                    Stop Loss (0-100):
-                    <input type="number" id="stop-loss-price" value="91" min="0" max="100" step="0.01" />
-                    <small>Sell when price drops to this level</small>
-                  </label>
-                </div>
+                  <div class="config-item">
+                    <label>
+                      Entry Price (0-100):
+                      <input type="number" id="entry-price" value="96" min="0" max="100" step="0.01" />
+                      <small>Order is filled when UP or DOWN value is equal or greater to this price</small>
+                    </label>
+                  </div>
+                  <div class="config-item">
+                    <label>
+                      Profit Target (0-100):
+                      <input type="number" id="profit-target-price" value="100" min="0" max="100" step="0.01" />
+                      <small>When active order's UP or DOWN value reaches this price, the order is sold</small>
+                    </label>
+                  </div>
+                  <div class="config-item">
+                    <label>
+                      Stop Loss (0-100):
+                      <input type="number" id="stop-loss-price" value="91" min="0" max="100" step="0.01" />
+                      <small>When UP or DOWN value reaches this price, the order is sold</small>
+                    </label>
+                  </div>
                 <div class="config-item">
                   <label>
                     Trade Size (USD):

@@ -175,7 +175,8 @@ export class TradingManager {
   }
 
   /**
-   * Check both UP and DOWN tokens and place limit order on whichever reaches entry price first
+   * Check both UP and DOWN tokens and place order when price is equal or greater than entry price
+   * Order is filled when UP or DOWN value is equal or greater to entry price
    */
   private async checkAndPlaceLimitOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
@@ -195,35 +196,23 @@ export class TradingManager {
       const yesPricePercent = toPercentage(yesPrice);
       const noPricePercent = toPercentage(noPrice);
 
-      // Calculate distance from entry price for both tokens
-      const yesDistance = Math.abs(yesPricePercent - entryPrice);
-      const noDistance = Math.abs(noPricePercent - entryPrice);
-
-      // Determine which token is closer to or at entry price (within 0.5%)
-      const threshold = 0.5;
+      // Check if either token price is equal or greater than entry price
+      // Order is filled when UP or DOWN value is >= entry price
       let tokenToTrade: string | null = null;
       let direction: 'UP' | 'DOWN' | null = null;
 
-      if (yesDistance <= threshold && noDistance <= threshold) {
-        // Both are at entry price, choose the one that's closer
-        if (yesDistance <= noDistance) {
-          tokenToTrade = yesTokenId;
-          direction = 'UP';
-        } else {
-          tokenToTrade = noTokenId;
-          direction = 'DOWN';
-        }
-      } else if (yesDistance <= threshold) {
-        // YES token is at entry price
+      // Check UP token first (YES token)
+      if (yesPricePercent >= entryPrice) {
         tokenToTrade = yesTokenId;
         direction = 'UP';
-      } else if (noDistance <= threshold) {
-        // NO token is at entry price
+      }
+      // Check DOWN token (NO token) - only if UP token hasn't reached entry price
+      else if (noPricePercent >= entryPrice) {
         tokenToTrade = noTokenId;
         direction = 'DOWN';
       }
 
-      // Place limit order on whichever token reached entry price first
+      // Place limit order when price is equal or greater than entry price
       if (tokenToTrade && direction) {
         await this.placeLimitOrder(tokenToTrade, entryPrice, direction);
       }
