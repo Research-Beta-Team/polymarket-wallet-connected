@@ -37,7 +37,7 @@ export interface PolymarketEvent {
 export class PolymarketAPI {
   static async fetchEventBySlug(slug: string): Promise<PolymarketEvent | null> {
     try {
-      const apiUrl = `${GAMMA_API_BASE}/events/slug/${slug}`;
+      const apiUrl = `${GAMMA_API_BASE}/markets/slug/${slug}`;
       console.log(`[PolymarketAPI] Fetching: ${apiUrl}`);
       
       const response = await fetch(apiUrl, {

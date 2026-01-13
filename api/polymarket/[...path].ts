@@ -99,8 +99,8 @@ export default async function handler(
 
     const data = await response.json();
     
-    // Log response structure for debugging (only for events endpoints)
-    if (apiPath.includes('events/slug')) {
+    // Log response structure for debugging (only for markets endpoints)
+    if (apiPath.includes('markets/slug')) {
       const market0 = data.markets?.[0];
       console.log(`[Proxy] Response structure for ${apiPath}:`, {
         hasMarkets: !!data.markets,
