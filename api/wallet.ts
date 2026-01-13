@@ -51,9 +51,21 @@ export default async function handler(
       const errorStack = error instanceof Error ? error.stack : undefined;
       console.error('[Wallet API] Error details:', { message: errorMessage, stack: errorStack });
       
+      // Provide more specific error messages
+      let userFriendlyError = 'Failed to derive wallet info';
+      if (errorMessage.includes('Cannot find module') || errorMessage.includes('Module not found')) {
+        userFriendlyError = 'Missing dependency. Ensure viem package is installed.';
+      } else if (errorMessage.includes('invalid private key') || errorMessage.includes('invalid hex')) {
+        userFriendlyError = 'Invalid private key format. Check POLYMARKET_MAGIC_PK environment variable.';
+      } else if (errorMessage.includes('ECONNREFUSED') || errorMessage.includes('network')) {
+        userFriendlyError = 'Network error. Check POLYGON_RPC_URL configuration.';
+      }
+      
+      res.setHeader('Access-Control-Allow-Origin', '*');
       return res.status(500).json({
-        error: 'Failed to derive wallet info',
+        error: userFriendlyError,
         message: errorMessage,
+        details: process.env.NODE_ENV === 'development' ? errorStack : undefined,
       });
     }
   }

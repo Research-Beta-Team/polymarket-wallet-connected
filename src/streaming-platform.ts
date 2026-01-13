@@ -1015,30 +1015,60 @@ export class StreamingPlatform {
 
     try {
       console.log('[Wallet] Attempting to connect...');
-      const response = await fetch('/api/wallet', {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
+      
+      let response: Response;
+      try {
+        response = await fetch('/api/wallet', {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        });
+      } catch (fetchError) {
+        // Network error or fetch failed
+        console.error('[Wallet] Fetch error:', fetchError);
+        const errorMsg = fetchError instanceof Error ? fetchError.message : 'Network error';
+        throw new Error(`Failed to reach API server: ${errorMsg}. Please check if the API endpoint is available.`);
+      }
 
-      console.log('[Wallet] Response status:', response.status);
+      console.log('[Wallet] Response status:', response.status, response.statusText);
+      
+      // Try to parse response as JSON
+      let responseData: any;
+      try {
+        const responseText = await response.text();
+        console.log('[Wallet] Response text:', responseText.substring(0, 200));
+        
+        if (!responseText) {
+          throw new Error('Empty response from server');
+        }
+        
+        try {
+          responseData = JSON.parse(responseText);
+        } catch (parseError) {
+          // Response is not JSON
+          throw new Error(`Invalid response format: ${responseText.substring(0, 100)}`);
+        }
+      } catch (parseError) {
+        console.error('[Wallet] Parse error:', parseError);
+        throw new Error(parseError instanceof Error ? parseError.message : 'Failed to parse server response');
+      }
       
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
-        console.error('[Wallet] Error response:', errorData);
-        throw new Error(errorData.error || `Failed to connect wallet (${response.status})`);
+        console.error('[Wallet] Error response:', responseData);
+        const errorMessage = responseData?.error || responseData?.message || `Server error (${response.status})`;
+        throw new Error(errorMessage);
       }
 
-      const data = await response.json();
-      console.log('[Wallet] Success:', data);
+      console.log('[Wallet] Success:', responseData);
 
-      if (!data.eoaAddress || !data.proxyAddress) {
-        throw new Error('Invalid wallet data received');
+      if (!responseData.eoaAddress || !responseData.proxyAddress) {
+        console.error('[Wallet] Invalid data structure:', responseData);
+        throw new Error('Invalid wallet data received: missing eoaAddress or proxyAddress');
       }
 
-      this.walletState.eoaAddress = data.eoaAddress;
-      this.walletState.proxyAddress = data.proxyAddress;
+      this.walletState.eoaAddress = responseData.eoaAddress;
+      this.walletState.proxyAddress = responseData.proxyAddress;
       this.walletState.isConnected = true;
       this.walletState.error = null;
 
@@ -1050,8 +1080,9 @@ export class StreamingPlatform {
 
       this.renderWalletSection();
     } catch (error) {
-      console.error('Wallet connection error:', error);
-      this.walletState.error = error instanceof Error ? error.message : 'Failed to connect wallet';
+      console.error('[Wallet] Connection error:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Failed to connect wallet';
+      this.walletState.error = errorMessage;
       this.walletState.isConnected = false;
       this.renderWalletSection();
     } finally {

@@ -1,7 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { Wallet, providers } from 'ethers';
 import { ClobClient } from '@polymarket/clob-client';
-import { deriveProxyAddress } from '../../utils/proxyWallet';
 import { CLOB_API_URL, POLYGON_CHAIN_ID, POLYGON_RPC_URL } from '../../constants/polymarket';
 
 export default async function handler(
