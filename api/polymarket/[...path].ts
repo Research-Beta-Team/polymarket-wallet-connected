@@ -34,10 +34,34 @@ export default async function handler(
   }
   
   // Fallback: Extract from URL if path is not in query
+  // This handles cases where Vercel routing doesn't populate req.query.path
   if (!apiPath && req.url) {
-    const urlMatch = req.url.match(/\/api\/polymarket\/(.+?)(?:\?|$)/);
-    if (urlMatch && urlMatch[1]) {
-      apiPath = urlMatch[1];
+    // Try multiple patterns to extract the path
+    const patterns = [
+      /\/api\/polymarket\/(.+?)(?:\?|$)/,  // Standard pattern
+      /\/api\/polymarket\/(.*)/,            // More permissive
+    ];
+    
+    for (const pattern of patterns) {
+      const urlMatch = req.url.match(pattern);
+      if (urlMatch && urlMatch[1]) {
+        apiPath = urlMatch[1];
+        break;
+      }
+    }
+  }
+  
+  // Additional fallback: Check if path is in the URL pathname
+  if (!apiPath && req.url) {
+    try {
+      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+      const pathParts = url.pathname.split('/');
+      const polymarketIndex = pathParts.indexOf('polymarket');
+      if (polymarketIndex >= 0 && pathParts.length > polymarketIndex + 1) {
+        apiPath = pathParts.slice(polymarketIndex + 1).join('/');
+      }
+    } catch (e) {
+      // URL parsing failed, continue with other methods
     }
   }
   
