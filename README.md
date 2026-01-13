@@ -475,4 +475,5 @@ For detailed information on data fetching mechanisms, see:
 MIT
 
 #   p o l y m a r k e t - w i t h - w a l l e t  
+ #   p o l y m a r k e t - w a l l e t - c o n n e c t e d  
  
