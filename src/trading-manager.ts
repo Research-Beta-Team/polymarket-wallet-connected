@@ -212,7 +212,6 @@ export class TradingManager {
   private async checkAndPlaceMarketOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
       const entryPrice = this.strategyConfig.entryPrice;
-      const priceTolerance = 0.1; // Small tolerance for floating point comparison
 
       // Get current market prices for both tokens
       const [yesPrice, noPrice] = await Promise.all([
@@ -228,19 +227,32 @@ export class TradingManager {
       const yesPricePercent = toPercentage(yesPrice);
       const noPricePercent = toPercentage(noPrice);
 
-      // Check if either token price exactly equals entry price (with small tolerance)
+      // Check if either token price reaches entry price (price >= entryPrice and <= entryPrice + 1)
+      // This allows entry when price is equal to or greater than entry price, up to entryPrice + 1
       let tokenToTrade: string | null = null;
       let direction: 'UP' | 'DOWN' | null = null;
 
-      // Check UP token first (YES token) - exact match
-      if (Math.abs(yesPricePercent - entryPrice) <= priceTolerance) {
+      // Check UP token first (YES token) - price >= entryPrice and <= entryPrice + 1
+      if (yesPricePercent >= entryPrice && yesPricePercent <= entryPrice + 1) {
         tokenToTrade = yesTokenId;
         direction = 'UP';
+        console.log(`[TradingManager] Entry condition met: yesTokenPrice ${yesPricePercent.toFixed(2)} >= entryPrice ${entryPrice.toFixed(2)} (within range up to ${(entryPrice + 1).toFixed(2)}) → Filling UP position`);
       }
-      // Check DOWN token (NO token) - exact match, only if UP token hasn't matched
-      else if (Math.abs(noPricePercent - entryPrice) <= priceTolerance) {
+      // Check DOWN token (NO token) - price >= entryPrice and <= entryPrice + 1, only if UP token hasn't matched
+      else if (noPricePercent >= entryPrice && noPricePercent <= entryPrice + 1) {
         tokenToTrade = noTokenId;
         direction = 'DOWN';
+        console.log(`[TradingManager] Entry condition met: noTokenPrice ${noPricePercent.toFixed(2)} >= entryPrice ${entryPrice.toFixed(2)} (within range up to ${(entryPrice + 1).toFixed(2)}) → Filling DOWN position`);
+      } else {
+        // Log why entry condition wasn't met for debugging
+        console.log(`[TradingManager] Entry condition not met:`, {
+          yesPricePercent: yesPricePercent.toFixed(2),
+          noPricePercent: noPricePercent.toFixed(2),
+          entryPrice: entryPrice.toFixed(2),
+          entryPriceMax: (entryPrice + 1).toFixed(2),
+          yesInRange: yesPricePercent >= entryPrice && yesPricePercent <= entryPrice + 1,
+          noInRange: noPricePercent >= entryPrice && noPricePercent <= entryPrice + 1,
+        });
       }
 
       // Place market order when price exactly equals entry price
