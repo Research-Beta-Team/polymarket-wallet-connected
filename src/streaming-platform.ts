@@ -45,7 +45,6 @@ export class StreamingPlatform {
     balanceLoading: false,
     apiCredentials: null,
   };
-  private ordersPollingInterval: number | null = null;
 
   constructor() {
     this.wsClient = new WebSocketClient();
@@ -61,8 +60,13 @@ export class StreamingPlatform {
     this.tradingManager.setOnStatusUpdate(() => {
       this.renderTradingSection();
     });
-    this.tradingManager.setOnTradeUpdate(() => {
+    this.tradingManager.setOnTradeUpdate((trade) => {
       this.renderTradingSection();
+      // When a buy order is filled, fetch and display orders
+      if (trade.side === 'BUY' && trade.status === 'filled') {
+        console.log('[Orders] Buy order filled, fetching order details...');
+        this.fetchAndDisplayOrders();
+      }
     });
     this.tradingManager.loadStrategyConfig();
   }
@@ -1183,9 +1187,8 @@ export class StreamingPlatform {
       // Fetch balance after initialization
       await this.fetchBalance();
 
-      // Start fetching orders
+      // Fetch orders once after initialization
       this.fetchAndDisplayOrders();
-      this.startOrdersPolling();
 
       this.renderWalletSection();
       alert('Trading session initialized successfully!');
@@ -1436,9 +1439,16 @@ export class StreamingPlatform {
                         <td><span class="status-badge status-${orderStatus.toLowerCase()}">${order.status || 'UNKNOWN'}</span></td>
                         <td>${order.created_at ? new Date(order.created_at * 1000).toLocaleString() : order.created_at_iso || '--'}</td>
                         <td>
-                          <button class="btn-cancel-order" data-order-id="${order.id}" ${!isLive ? 'disabled title="Order cannot be cancelled"' : ''}>
-                            ${isLive ? 'Cancel' : '--'}
-                          </button>
+                          ${isLive 
+                            ? `<button class="btn-cancel-order" data-order-id="${order.id}">Cancel</button>`
+                            : isFilled && order.side === 'BUY'
+                            ? `<button class="btn-sell-order" 
+                                 data-order-id="${order.id}" 
+                                 data-token-id="${order.asset_id || order.token_id || ''}" 
+                                 data-size="${order.size_matched || order.filled_size || order.original_size || order.size || 0}"
+                                 data-price="${order.price || 0}">Sell</button>`
+                            : '--'
+                          }
                         </td>
                       </tr>
                     `;
@@ -1448,7 +1458,7 @@ export class StreamingPlatform {
           </table>
         `;
 
-        // Add event listeners for cancel buttons (only if there are orders)
+        // Add event listeners for cancel and sell buttons (only if there are orders)
         if (orders.length > 0) {
           const cancelButtons = ordersContainer.querySelectorAll('.btn-cancel-order');
           cancelButtons.forEach(btn => {
@@ -1456,6 +1466,19 @@ export class StreamingPlatform {
               const orderId = (e.target as HTMLButtonElement).getAttribute('data-order-id');
               if (orderId) {
                 await this.cancelOrder(orderId);
+              }
+            });
+          });
+
+          const sellButtons = ordersContainer.querySelectorAll('.btn-sell-order');
+          sellButtons.forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+              const orderId = (e.target as HTMLButtonElement).getAttribute('data-order-id');
+              const tokenId = (e.target as HTMLButtonElement).getAttribute('data-token-id');
+              const size = (e.target as HTMLButtonElement).getAttribute('data-size');
+              const price = (e.target as HTMLButtonElement).getAttribute('data-price');
+              if (orderId && tokenId && size) {
+                await this.sellOrder(orderId, tokenId, parseFloat(size), parseFloat(price || '0'));
               }
             });
           });
@@ -1536,26 +1559,139 @@ export class StreamingPlatform {
   }
 
   /**
-   * Start polling for orders updates
+   * Sell order using order information
+   * Sells the entire position (max shares) for the given order
    */
-  private startOrdersPolling(): void {
-    this.stopOrdersPolling();
-    
-    // Poll every 5 seconds
-    this.ordersPollingInterval = window.setInterval(() => {
-      if (this.walletState.isInitialized) {
-        this.fetchAndDisplayOrders();
-      }
-    }, 5000);
-  }
+  private async sellOrder(orderId: string, tokenId: string, size: number, entryPrice: number): Promise<void> {
+    if (!this.walletState.apiCredentials) {
+      alert('API credentials not available');
+      return;
+    }
 
-  /**
-   * Stop polling for orders
-   */
-  private stopOrdersPolling(): void {
-    if (this.ordersPollingInterval !== null) {
-      clearInterval(this.ordersPollingInterval);
-      this.ordersPollingInterval = null;
+    if (!confirm(`Sell entire position for order ${orderId.substring(0, 8)}...?\nSize: $${size.toFixed(2)}\nEntry Price: ${entryPrice.toFixed(2)}`)) {
+      return;
+    }
+
+    try {
+      console.log('[Orders] Selling order:', {
+        orderId,
+        tokenId,
+        size,
+        entryPrice,
+      });
+
+      // Use trading manager to close position with this order's information
+      const position = this.tradingManager.getStatus().currentPosition;
+      
+      if (position && position.tokenId === tokenId) {
+        // If there's an active position for this token, use trading manager's closePosition
+        console.log('[Orders] Using TradingManager to close position');
+        // We need to trigger the closePosition method
+        // Since it's private, we'll call it through the trading manager's exit mechanism
+        // For now, let's directly place a sell order
+      }
+
+      // Place sell order directly
+      if (this.tradingManager.getApiCredentials()) {
+        const browserClobClient = (this.tradingManager as any).browserClobClient;
+        
+        if (browserClobClient) {
+          const { OrderType, Side } = await import('@polymarket/clob-client');
+          
+          // Get bid price for SELL orders
+          const bidPriceResponse = await browserClobClient.getPrice(tokenId, Side.BUY);
+          const bidPrice = parseFloat(bidPriceResponse.price);
+          
+          if (isNaN(bidPrice) || bidPrice <= 0 || bidPrice >= 1) {
+            throw new Error('Invalid market price for SELL');
+          }
+
+          // Get fee rate
+          let feeRateBps: number;
+          try {
+            feeRateBps = await browserClobClient.getFeeRateBps(tokenId);
+            if (!feeRateBps || feeRateBps === 0) {
+              feeRateBps = 1000;
+            }
+          } catch (error) {
+            feeRateBps = 1000;
+          }
+
+          // Calculate shares from USD size
+          // Position size is in USD, so shares = USD / price
+          const shares = size / bidPrice;
+
+          const marketOrder = {
+            tokenID: tokenId,
+            amount: shares,
+            side: Side.SELL,
+            feeRateBps: feeRateBps,
+          };
+
+          console.log('[Orders] Browser SELL order details:', {
+            bidPrice: bidPrice.toFixed(4),
+            bidPricePercent: (bidPrice * 100).toFixed(2),
+            positionSizeUSD: size,
+            shares: shares.toFixed(2),
+          });
+
+          const response = await browserClobClient.createAndPostMarketOrder(
+            marketOrder,
+            { negRisk: false },
+            OrderType.FAK
+          );
+
+          if (response?.orderID) {
+            console.log('[Orders] ✅ SELL order placed successfully:', response.orderID);
+            alert(`Sell order placed successfully!\nOrder ID: ${response.orderID.substring(0, 8)}...`);
+            
+            // Refresh orders list
+            await this.fetchAndDisplayOrders();
+          } else {
+            throw new Error('Order submission failed - no order ID returned');
+          }
+        } else {
+          // Fallback to server-side API
+          const bidPrice = await fetch(`/api/clob-proxy?side=BUY&token_id=${tokenId}`)
+            .then(res => res.json())
+            .then(data => parseFloat(data.price));
+
+          if (!bidPrice || isNaN(bidPrice) || bidPrice <= 0 || bidPrice >= 1) {
+            throw new Error('Invalid market price');
+          }
+
+          const shares = size / bidPrice;
+
+          const response = await fetch('/api/orders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              tokenId,
+              size: shares,
+              side: 'SELL',
+              isMarketOrder: true,
+              apiCredentials: this.walletState.apiCredentials,
+              negRisk: false,
+            }),
+          });
+
+          const data = await response.json();
+          if (response.ok && data.orderId) {
+            console.log('[Orders] ✅ SELL order placed successfully:', data.orderId);
+            alert(`Sell order placed successfully!\nOrder ID: ${data.orderId.substring(0, 8)}...`);
+            
+            // Refresh orders list
+            await this.fetchAndDisplayOrders();
+          } else {
+            throw new Error(data.error || 'Order failed');
+          }
+        }
+      } else {
+        throw new Error('API credentials not available');
+      }
+    } catch (error) {
+      console.error('[Orders] ❌ Error selling order:', error);
+      alert(`Failed to sell order: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 

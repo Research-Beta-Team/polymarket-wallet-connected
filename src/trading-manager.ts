@@ -44,7 +44,7 @@ export class TradingManager {
     return {
       enabled: false,
       entryPrice: 96, // Limit order at 96
-      profitTargetPrice: 100, // Take profit at 100
+      profitTargetPrice: 99, // Take profit at 100
       stopLossPrice: 91, // Stop loss at 91
       tradeSize: 50, // $50 trade size
     };
@@ -171,8 +171,7 @@ export class TradingManager {
 
     // If we have a position, check exit conditions
     if (this.status.currentPosition?.eventSlug === this.activeEvent.slug) {
-      const positionTokenId = this.status.currentPosition.tokenId;
-      await this.checkExitConditions(positionTokenId);
+      await this.checkExitConditions();
       return;
     }
 
@@ -615,14 +614,15 @@ export class TradingManager {
 
   /**
    * Check exit conditions: profit target and stop loss
+   * Uses the same variables as entry condition (yesPricePercent, noPricePercent)
    * For UP direction:
-   *   - Profit Target: Sell when UP value exactly equals profit target
-   *   - Stop Loss: Sell when UP value >= stop loss (with adaptive selling)
+   *   - Profit Target: Sell when UP value >= profit target
+   *   - Stop Loss: Sell when UP value <= stop loss (with adaptive selling)
    * For DOWN direction:
    *   - Profit Target: Sell when DOWN value >= profit target
    *   - Stop Loss: Sell when DOWN value <= stop loss (with adaptive selling)
    */
-  private async checkExitConditions(tokenId: string): Promise<void> {
+  private async checkExitConditions(): Promise<void> {
     if (!this.status.currentPosition) {
       return;
     }
@@ -632,20 +632,39 @@ export class TradingManager {
       return;
     }
 
+    if (!this.activeEvent || !this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
+      return;
+    }
+
     try {
-      // Get current price for the token
-      const currentMarketPrice = await this.clobClient.getPrice(tokenId, 'SELL'); // Sell to exit position
-      
-      if (!currentMarketPrice) {
+      const yesTokenId = this.activeEvent.clobTokenIds[0]; // YES/UP token
+      const noTokenId = this.activeEvent.clobTokenIds[1]; // NO/DOWN token
+
+      if (!yesTokenId || !noTokenId) {
         return;
       }
 
-      const currentPricePercent = toPercentage(currentMarketPrice);
+      // Get current market prices for both tokens (same as entry condition)
+      const [yesPrice, noPrice] = await Promise.all([
+        this.clobClient.getPrice(yesTokenId, 'SELL'),
+        this.clobClient.getPrice(noTokenId, 'SELL'),
+      ]);
+
+      if (!yesPrice || !noPrice) {
+        return;
+      }
+
+      // Convert to percentage scale (0-100) - same variables as entry condition
+      const yesPricePercent = toPercentage(yesPrice);
+      const noPricePercent = toPercentage(noPrice);
+
       const entryPrice = this.status.currentPosition.entryPrice;
       const profitTarget = this.strategyConfig.profitTargetPrice;
       const stopLoss = this.strategyConfig.stopLossPrice;
-      const priceTolerance = 0.1; // Small tolerance for floating point comparison
       const direction = this.status.currentPosition.direction;
+
+      // Use the appropriate price based on direction
+      const currentPricePercent = direction === 'UP' ? yesPricePercent : noPricePercent;
 
       // Update current position
       this.status.currentPosition.currentPrice = currentPricePercent;
@@ -667,28 +686,28 @@ export class TradingManager {
       
       this.status.currentPosition.unrealizedProfit = unrealizedProfit;
 
-      // Check exit conditions based on direction
+      // Check exit conditions based on direction using yesPricePercent/noPricePercent
       if (direction === 'UP') {
         // UP direction: 
-        // - Profit target: exact match
-        // - Stop loss: when UP price drops TO or BELOW stop loss (sell immediately or adaptive selling as fallback)
-        if (Math.abs(currentPricePercent - profitTarget) <= priceTolerance) {
-          await this.closePosition(`Profit target reached at ${currentPricePercent.toFixed(2)}`);
-        } else if (currentPricePercent <= stopLoss) {
+        // - Profit target: when UP value >= profit target
+        // - Stop loss: when UP value <= stop loss (with adaptive selling)
+        if (yesPricePercent >= profitTarget) {
+          await this.closePosition(`Profit target reached at ${yesPricePercent.toFixed(2)}`);
+        } else if (yesPricePercent <= stopLoss) {
           // UP price dropped to stop loss - try to sell immediately, use adaptive selling as fallback
-          console.log(`[TradingManager] UP stop loss triggered: current price ${currentPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
-          await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${currentPricePercent.toFixed(2)}`, stopLoss, false);
+          console.log(`[TradingManager] UP stop loss triggered: yesPricePercent ${yesPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
+          await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${yesPricePercent.toFixed(2)}`, stopLoss, false, yesPricePercent, noPricePercent);
         }
       } else {
         // DOWN direction:
-        // - Profit target: when DOWN price >= profit target
-        // - Stop loss: when DOWN price drops TO or BELOW stop loss (after decreasing from entry) - sell immediately or adaptive selling as fallback
-        if (currentPricePercent >= profitTarget) {
-          await this.closePosition(`Profit target reached at ${currentPricePercent.toFixed(2)}`);
-        } else if (currentPricePercent <= stopLoss) {
+        // - Profit target: when DOWN value >= profit target
+        // - Stop loss: when DOWN value <= stop loss (with adaptive selling)
+        if (noPricePercent >= profitTarget) {
+          await this.closePosition(`Profit target reached at ${noPricePercent.toFixed(2)}`);
+        } else if (noPricePercent <= stopLoss) {
           // DOWN price dropped to stop loss - try to sell immediately, use adaptive selling as fallback
-          console.log(`[TradingManager] DOWN stop loss triggered: current price ${currentPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
-          await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${currentPricePercent.toFixed(2)}`, stopLoss, true);
+          console.log(`[TradingManager] DOWN stop loss triggered: noPricePercent ${noPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
+          await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${noPricePercent.toFixed(2)}`, stopLoss, true, yesPricePercent, noPricePercent);
         }
       }
 
@@ -700,12 +719,19 @@ export class TradingManager {
 
   /**
    * Close position with adaptive selling for stop loss
+   * Uses yesPricePercent and noPricePercent (same as entry/exit conditions)
    * First tries to sell immediately at current market price
    * If that fails, uses adaptive selling as fallback:
    *   - For UP direction: Tries progressively lower prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
    *   - For DOWN direction: Tries to sell at market price (price already dropped, just sell)
    */
-  private async closePositionWithAdaptiveSelling(reason: string, stopLossPrice: number, isDownDirection: boolean = false): Promise<void> {
+  private async closePositionWithAdaptiveSelling(
+    reason: string, 
+    stopLossPrice: number, 
+    isDownDirection: boolean = false,
+    yesPricePercent: number,
+    noPricePercent: number
+  ): Promise<void> {
     if (!this.status.currentPosition) {
       return;
     }
@@ -720,32 +746,30 @@ export class TradingManager {
     this.isPlacingSplitOrders = true;
 
     try {
-      const position = this.status.currentPosition;
+      // Use the appropriate price based on direction (same variables as entry/exit conditions)
+      const currentPricePercent = isDownDirection ? noPricePercent : yesPricePercent;
       
       console.log('[TradingManager] Stop loss triggered - attempting immediate sell:', {
         stopLossPrice,
         direction: isDownDirection ? 'DOWN' : 'UP',
+        currentPrice: currentPricePercent.toFixed(2),
         reason,
       });
 
-      // First, try to sell immediately at current market price
-      try {
-        const currentMarketPrice = await this.clobClient.getPrice(position.tokenId, 'SELL');
-        if (currentMarketPrice) {
-          const currentPricePercent = toPercentage(currentMarketPrice);
-          console.log(`[TradingManager] Attempting immediate sell at current market price: ${currentPricePercent.toFixed(2)}`);
-          
-          // Try immediate sell
-          this.isPlacingOrder = false;
-          this.isPlacingSplitOrders = false;
-          await this.closePosition(`${reason} - Immediate sell at ${currentPricePercent.toFixed(2)}`);
-          return;
-        }
-      } catch (error) {
-        console.warn('[TradingManager] Immediate sell failed, falling back to adaptive selling:', error);
-      }
-
-      // If immediate sell failed, use adaptive selling as fallback
+      // First, try to sell immediately at current market price using yesPricePercent/noPricePercent
+      console.log(`[TradingManager] Attempting immediate sell at current market price: ${currentPricePercent.toFixed(2)}`);
+      
+      // Try immediate sell first
+      this.isPlacingOrder = false;
+      this.isPlacingSplitOrders = false;
+      await this.closePosition(`${reason} - Immediate sell at ${currentPricePercent.toFixed(2)}`);
+      
+      // If we reach here, immediate sell was attempted
+      // Adaptive selling below uses yesPricePercent/noPricePercent for consistency
+      // Note: In practice, closePosition should handle the sell, but we keep adaptive logic
+      // as a safety mechanism that uses the same price variables
+      
+      // Adaptive selling as fallback (uses same variables: yesPricePercent/noPricePercent)
       this.isPlacingOrder = true;
       this.isPlacingSplitOrders = true;
       
@@ -754,6 +778,7 @@ export class TradingManager {
         stopLossPrice,
         maxAttempts,
         isDownDirection,
+        currentPrice: currentPricePercent.toFixed(2),
       });
 
       // For UP: try progressively lower prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
@@ -779,29 +804,24 @@ export class TradingManager {
         try {
           console.log(`[TradingManager] Adaptive attempt ${attempt + 1}/${maxAttempts}: Trying to sell at price ${targetPrice.toFixed(2)}`);
           
-          // Get current market price
-          const currentMarketPrice = await this.clobClient.getPrice(position.tokenId, 'SELL');
-          if (!currentMarketPrice) {
-            throw new Error('Could not get market price');
-          }
-
-          const currentPricePercent = toPercentage(currentMarketPrice);
+          // Use the current price from yesPricePercent/noPricePercent
+          const currentPrice = isDownDirection ? noPricePercent : yesPricePercent;
           
           // For UP: sell when price is at/below target (price dropped to stop loss)
           // For DOWN: sell when price is at/above target (can sell at stop loss or slightly above)
           const canSell = isDownDirection 
-            ? currentPricePercent >= targetPrice  // DOWN: can sell if price is at/above target
-            : currentPricePercent <= targetPrice; // UP: price dropped to/below target
+            ? currentPrice >= targetPrice  // DOWN: can sell if price is at/above target
+            : currentPrice <= targetPrice; // UP: price dropped to/below target
             
           if (canSell) {
-            console.log(`[TradingManager] Current price ${currentPricePercent.toFixed(2)} meets target ${targetPrice.toFixed(2)}, proceeding with sale`);
+            console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} meets target ${targetPrice.toFixed(2)}, proceeding with sale`);
             this.isPlacingOrder = false;
             this.isPlacingSplitOrders = false;
-            await this.closePosition(`${reason} - Adaptive sell at ${currentPricePercent.toFixed(2)} (target was ${targetPrice.toFixed(2)})`);
+            await this.closePosition(`${reason} - Adaptive sell at ${currentPrice.toFixed(2)} (target was ${targetPrice.toFixed(2)})`);
             return;
           } else {
             const directionText = isDownDirection ? 'below' : 'above';
-            console.log(`[TradingManager] Current price ${currentPricePercent.toFixed(2)} is ${directionText} target ${targetPrice.toFixed(2)}, will try ${isDownDirection ? 'higher' : 'lower'} price on next attempt`);
+            console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} is ${directionText} target ${targetPrice.toFixed(2)}, will try ${isDownDirection ? 'higher' : 'lower'} price on next attempt`);
             await new Promise(resolve => setTimeout(resolve, 500));
           }
         } catch (error) {
