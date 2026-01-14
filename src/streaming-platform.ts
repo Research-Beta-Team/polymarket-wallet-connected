@@ -171,6 +171,9 @@ export class StreamingPlatform {
       });
       // Make header cursor pointer
       eventsHeader.style.cursor = 'pointer';
+      // Ensure initial state is collapsed
+      eventsContent.classList.add('collapsed');
+      eventsChevron.textContent = '▶';
     }
   }
 
@@ -782,9 +785,9 @@ export class StreamingPlatform {
         <div class="events-section">
           <div class="events-section-header" id="events-section-header">
             <h2>BTC Up/Down 15m Events</h2>
-            <span class="events-chevron" id="events-chevron">▼</span>
+            <span class="events-chevron" id="events-chevron">▶</span>
           </div>
-          <div class="events-section-content" id="events-section-content">
+          <div class="events-section-content collapsed" id="events-section-content">
             <div id="events-error" class="error-message"></div>
             <div class="events-table-container">
               <table class="events-table">
