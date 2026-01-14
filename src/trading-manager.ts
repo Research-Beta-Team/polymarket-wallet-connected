@@ -536,6 +536,21 @@ export class TradingManager {
           avgEntryPrice: avgEntryPrice.toFixed(2),
           numOrders: filledOrders.length,
         });
+        
+        // After all orders are placed, fetch order details to show in orders table
+        // Delay to ensure orders are registered in the system
+        console.log('[TradingManager] All buy orders placed, will fetch order details in 2 seconds...');
+        setTimeout(() => {
+          // Trigger order fetch via trade update callback
+          if (this.onTradeUpdate && filledOrders.length > 0) {
+            // Create a synthetic trade update to trigger order fetch
+            const lastTrade = this.trades[this.trades.length - 1];
+            if (lastTrade) {
+              console.log('[TradingManager] Triggering order fetch after buy orders...');
+              this.onTradeUpdate(lastTrade);
+            }
+          }
+        }, 2000); // 2 second delay to ensure orders are registered
       } else {
         console.error('[TradingManager] ❌ All orders failed');
         this.status.failedTrades++;
