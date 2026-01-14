@@ -975,6 +975,7 @@ export class StreamingPlatform {
     const status = this.tradingManager.getStatus();
     const config = this.tradingManager.getStrategyConfig();
     const trades = this.tradingManager.getTrades();
+    console.log(`[StreamingPlatform] renderTradingSection called, rendering ${trades.length} trades`);
 
     // Update strategy config inputs
     const enabledInput = document.getElementById('strategy-enabled') as HTMLInputElement;
@@ -1077,8 +1078,8 @@ export class StreamingPlatform {
                   <td class="event-slug">${trade.eventSlug}</td>
                   <td><span class="side-${trade.side.toLowerCase()}">${trade.side}</span> ${trade.direction ? `<span class="direction-badge direction-${trade.direction.toLowerCase()}">${trade.direction}</span>` : ''}</td>
                   <td>$${trade.size.toFixed(2)}</td>
-                  <td>${trade.price.toFixed(2)}${trade.orderType === 'LIMIT' && trade.limitPrice ? ` (limit: ${trade.limitPrice.toFixed(2)})` : ''}</td>
-                  <td><span class="status-badge status-${trade.status}">${trade.status}</span> ${trade.orderType === 'LIMIT' ? '<span class="order-type">LIMIT</span>' : ''}</td>
+                  <td>${trade.price.toFixed(2)}${trade.orderType === 'LIMIT' && trade.limitPrice ? ` (limit: ${trade.limitPrice.toFixed(2)})` : trade.orderType === 'MARKET' ? ' (FAK)' : ''}</td>
+                  <td><span class="status-badge status-${trade.status}">${trade.status}</span> ${trade.orderType === 'LIMIT' ? '<span class="order-type">LIMIT</span>' : trade.orderType === 'MARKET' ? '<span class="order-type">MARKET (FAK)</span>' : ''}</td>
                   <td class="${trade.profit !== undefined ? (trade.profit >= 0 ? 'profit' : 'loss') : ''}">
                     ${trade.profit !== undefined ? `$${trade.profit.toFixed(2)}` : '--'}
                   </td>

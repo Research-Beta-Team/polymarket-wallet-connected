@@ -545,11 +545,16 @@ export class TradingManager {
           console.log(`[TradingManager] ✅ Trade added to history:`, {
             tradeId: trade.id,
             direction: trade.direction,
+            side: trade.side,
             size: trade.size,
             price: trade.price,
+            status: trade.status,
+            orderType: trade.orderType,
             totalTrades: this.trades.length,
+            hasCallback: !!this.onTradeUpdate,
           });
           this.notifyTradeUpdate(trade);
+          console.log(`[TradingManager] ✅ notifyTradeUpdate called, callback should trigger renderTradingSection`);
         } else {
           console.error(`[TradingManager] ❌ Split order ${i + 1}/${orderSplits.length} failed:`, {
             error: result.error,
@@ -1261,6 +1266,7 @@ export class TradingManager {
   }
 
   getTrades(): Trade[] {
+    console.log(`[TradingManager] getTrades() called, returning ${this.trades.length} trades`);
     return [...this.trades];
   }
 
@@ -1275,8 +1281,23 @@ export class TradingManager {
   }
 
   private notifyTradeUpdate(trade: Trade): void {
+    console.log(`[TradingManager] notifyTradeUpdate called:`, {
+      tradeId: trade.id,
+      side: trade.side,
+      direction: trade.direction,
+      status: trade.status,
+      orderType: trade.orderType,
+      hasCallback: !!this.onTradeUpdate,
+    });
     if (this.onTradeUpdate) {
-      this.onTradeUpdate(trade);
+      try {
+        this.onTradeUpdate(trade);
+        console.log(`[TradingManager] ✅ onTradeUpdate callback executed successfully`);
+      } catch (error) {
+        console.error(`[TradingManager] ❌ Error in onTradeUpdate callback:`, error);
+      }
+    } else {
+      console.warn(`[TradingManager] ⚠️ onTradeUpdate callback is not set!`);
     }
   }
 
