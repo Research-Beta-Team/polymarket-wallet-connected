@@ -1028,6 +1028,34 @@ header h1 {
   background-color: #fff;
 }
 
+.orders-table .order-row.order-position {
+  background-color: #e7f3ff;
+  border-left: 4px solid #667eea;
+  font-weight: 500;
+}
+
+.orders-table .order-row.order-position:hover {
+  background-color: #d0e7ff;
+}
+
+.btn-sell-position {
+  background: #667eea !important;
+  font-weight: 600;
+}
+
+.btn-sell-position:hover {
+  background: #5568d3 !important;
+}
+
+.status-badge.status-position {
+  background: #667eea;
+  color: white;
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
 .order-id,
 .token-id {
   font-family: 'Courier New', monospace;
