@@ -355,7 +355,7 @@ export class TradingManager {
         }
       } else {
         // Fallback to server-side API
-        const askPrice = await this.clobClient.getPrice(tokenId, 'SELL');
+        const askPrice = await this.clobClient.getPrice(tokenId, 'BUY');
         if (!askPrice || isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
           return { success: false, error: 'Invalid market price' };
         }
