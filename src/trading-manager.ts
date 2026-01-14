@@ -139,7 +139,26 @@ export class TradingManager {
       return;
     }
 
-    // Check Price Difference condition if configured
+    // Check if we have token IDs for the active event
+    if (!this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
+      return;
+    }
+
+    const yesTokenId = this.activeEvent.clobTokenIds[0]; // YES/UP token
+    const noTokenId = this.activeEvent.clobTokenIds[1]; // NO/DOWN token
+
+    if (!yesTokenId || !noTokenId) {
+      return;
+    }
+
+    // If we have a position, check exit conditions FIRST (regardless of price difference)
+    // Price difference check only applies to entry conditions, not exit conditions
+    if (this.status.currentPosition?.eventSlug === this.activeEvent.slug) {
+      await this.checkExitConditions();
+      return;
+    }
+
+    // Price Difference condition check - only applies to entry conditions (when no position exists)
     if (this.strategyConfig.priceDifference !== null && this.strategyConfig.priceDifference !== undefined) {
       if (this.currentPrice === null || this.priceToBeat === null) {
         // Need both prices to check condition
@@ -155,24 +174,6 @@ export class TradingManager {
         // Price difference condition not met, skip trading
         return;
       }
-    }
-
-    // Check if we have token IDs for the active event
-    if (!this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
-      return;
-    }
-
-    const yesTokenId = this.activeEvent.clobTokenIds[0]; // YES/UP token
-    const noTokenId = this.activeEvent.clobTokenIds[1]; // NO/DOWN token
-
-    if (!yesTokenId || !noTokenId) {
-      return;
-    }
-
-    // If we have a position, check exit conditions
-    if (this.status.currentPosition?.eventSlug === this.activeEvent.slug) {
-      await this.checkExitConditions();
-      return;
     }
 
     // Prevent multiple simultaneous orders
@@ -702,27 +703,43 @@ export class TradingManager {
       this.status.currentPosition.unrealizedProfit = unrealizedProfit;
 
       // Check exit conditions based on direction using yesPricePercent/noPricePercent
+      // Add debug logging to track condition checks
+      console.log(`[TradingManager] Checking exit conditions:`, {
+        direction,
+        yesPricePercent: yesPricePercent.toFixed(2),
+        noPricePercent: noPricePercent.toFixed(2),
+        profitTarget: profitTarget.toFixed(2),
+        stopLoss: stopLoss.toFixed(2),
+        entryPrice: entryPrice.toFixed(2),
+      });
+
       if (direction === 'UP') {
         // UP direction: 
         // - Profit target: when UP value >= profit target
         // - Stop loss: when UP value <= stop loss (with adaptive selling)
         if (yesPricePercent >= profitTarget) {
+          console.log(`[TradingManager] ✅ UP profit target met: ${yesPricePercent.toFixed(2)} >= ${profitTarget.toFixed(2)}`);
           await this.closePosition(`Profit target reached at ${yesPricePercent.toFixed(2)}`);
         } else if (yesPricePercent <= stopLoss) {
           // UP price dropped to stop loss - try to sell immediately, use adaptive selling as fallback
-          console.log(`[TradingManager] UP stop loss triggered: yesPricePercent ${yesPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
+          console.log(`[TradingManager] ⚠️ UP stop loss triggered: yesPricePercent ${yesPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
           await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${yesPricePercent.toFixed(2)}`, stopLoss, false, yesPricePercent, noPricePercent);
+        } else {
+          console.log(`[TradingManager] No exit condition met for UP: price ${yesPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`);
         }
       } else {
         // DOWN direction:
         // - Profit target: when DOWN value >= profit target
         // - Stop loss: when DOWN value <= stop loss (with adaptive selling)
         if (noPricePercent >= profitTarget) {
+          console.log(`[TradingManager] ✅ DOWN profit target met: ${noPricePercent.toFixed(2)} >= ${profitTarget.toFixed(2)}`);
           await this.closePosition(`Profit target reached at ${noPricePercent.toFixed(2)}`);
         } else if (noPricePercent <= stopLoss) {
           // DOWN price dropped to stop loss - try to sell immediately, use adaptive selling as fallback
-          console.log(`[TradingManager] DOWN stop loss triggered: noPricePercent ${noPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
+          console.log(`[TradingManager] ⚠️ DOWN stop loss triggered: noPricePercent ${noPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
           await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${noPricePercent.toFixed(2)}`, stopLoss, true, yesPricePercent, noPricePercent);
+        } else {
+          console.log(`[TradingManager] No exit condition met for DOWN: price ${noPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`);
         }
       }
 
