@@ -255,12 +255,28 @@ export class TradingManager {
         });
       }
 
-      // Place market order when price exactly equals entry price
+      // Place market order when price reaches entry price
       if (tokenToTrade && direction) {
+        console.log(`[TradingManager] ✅ Entry condition met, calling placeMarketOrder:`, {
+          tokenId: tokenToTrade,
+          direction,
+          entryPrice,
+          yesPricePercent: yesPricePercent.toFixed(2),
+          noPricePercent: noPricePercent.toFixed(2),
+        });
         await this.placeMarketOrder(tokenToTrade, entryPrice, direction);
+      } else {
+        // Log why order wasn't placed even though we're checking
+        console.log(`[TradingManager] Entry condition check completed but no order placed:`, {
+          tokenToTrade,
+          direction,
+          yesPricePercent: yesPricePercent.toFixed(2),
+          noPricePercent: noPricePercent.toFixed(2),
+          entryPrice,
+        });
       }
     } catch (error) {
-      console.error('Error checking for market order placement:', error);
+      console.error('[TradingManager] ❌ Error checking for market order placement:', error);
     }
   }
 
@@ -494,6 +510,12 @@ export class TradingManager {
         );
 
         if (result.success && result.orderId && result.fillPrice !== undefined) {
+          console.log(`[TradingManager] ✅ Split order ${i + 1}/${orderSplits.length} filled successfully:`, {
+            orderId: result.orderId,
+            fillPrice: result.fillPrice.toFixed(2),
+            size: split.size,
+          });
+
           filledOrders.push({
             orderId: result.orderId,
             price: result.fillPrice,
@@ -520,9 +542,21 @@ export class TradingManager {
 
           this.trades.push(trade);
           this.status.totalTrades++;
+          console.log(`[TradingManager] ✅ Trade added to history:`, {
+            tradeId: trade.id,
+            direction: trade.direction,
+            size: trade.size,
+            price: trade.price,
+            totalTrades: this.trades.length,
+          });
           this.notifyTradeUpdate(trade);
         } else {
-          console.error(`[TradingManager] ❌ Split order ${i + 1}/${orderSplits.length} failed:`, result.error);
+          console.error(`[TradingManager] ❌ Split order ${i + 1}/${orderSplits.length} failed:`, {
+            error: result.error,
+            success: result.success,
+            hasOrderId: !!result.orderId,
+            hasFillPrice: result.fillPrice !== undefined,
+          });
           // Continue with other orders even if one fails
         }
 
@@ -550,11 +584,14 @@ export class TradingManager {
         };
 
         this.status.successfulTrades++;
-        console.log('[TradingManager] ✅ Position created:', {
+        console.log('[TradingManager] ✅ Position created successfully:', {
           direction,
           totalSize: totalFilledSize.toFixed(2),
           avgEntryPrice: avgEntryPrice.toFixed(2),
           numOrders: filledOrders.length,
+          tokenId,
+          eventSlug: this.activeEvent!.slug,
+          totalTradesInHistory: this.trades.length,
         });
         
         // After all orders are placed, fetch order details to show in orders table
@@ -572,17 +609,33 @@ export class TradingManager {
           }
         }, 2000); // 2 second delay to ensure orders are registered
       } else {
-        console.error('[TradingManager] ❌ All orders failed');
+        console.error('[TradingManager] ❌ All orders failed - no trades added to history:', {
+          tokenId,
+          direction,
+          entryPrice,
+          numSplits: orderSplits.length,
+          hasApiCredentials: !!this.apiCredentials,
+        });
         this.status.failedTrades++;
       }
 
       this.notifyStatusUpdate();
     } catch (error) {
-      console.error('[TradingManager] ❌ Error placing market order:', error);
+      console.error('[TradingManager] ❌ Error placing market order:', {
+        error: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        tokenId,
+        direction,
+        entryPrice,
+      });
       this.status.failedTrades++;
     } finally {
       this.isPlacingOrder = false;
       this.isPlacingSplitOrders = false;
+      console.log('[TradingManager] Order placement flags reset:', {
+        isPlacingOrder: this.isPlacingOrder,
+        isPlacingSplitOrders: this.isPlacingSplitOrders,
+      });
     }
   }
 
