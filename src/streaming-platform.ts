@@ -152,6 +152,26 @@ export class StreamingPlatform {
     refreshOrdersBtn?.addEventListener('click', () => {
       this.fetchAndDisplayOrders();
     });
+
+    // Events section collapsible functionality
+    const eventsHeader = document.getElementById('events-section-header');
+    const eventsContent = document.getElementById('events-section-content');
+    const eventsChevron = document.getElementById('events-chevron');
+    
+    if (eventsHeader && eventsContent && eventsChevron) {
+      eventsHeader.addEventListener('click', () => {
+        const isCollapsed = eventsContent.classList.contains('collapsed');
+        if (isCollapsed) {
+          eventsContent.classList.remove('collapsed');
+          eventsChevron.textContent = '▼';
+        } else {
+          eventsContent.classList.add('collapsed');
+          eventsChevron.textContent = '▶';
+        }
+      });
+      // Make header cursor pointer
+      eventsHeader.style.cursor = 'pointer';
+    }
   }
 
   private handlePriceUpdate(update: PriceUpdate): void {
@@ -760,29 +780,34 @@ export class StreamingPlatform {
         </div>
 
         <div class="events-section">
-          <h2>BTC Up/Down 15m Events</h2>
-          <div id="events-error" class="error-message"></div>
-          <div class="events-table-container">
-            <table class="events-table">
-              <thead>
-                <tr>
-                  <th>Title</th>
-                  <th>Start Date</th>
-                  <th>End Date</th>
-                  <th>Status</th>
-                  <th>Price to Beat</th>
-                  <th>Condition ID</th>
-                  <th>Question ID</th>
-                  <th>CLOB Token IDs</th>
-                  <th>Slug</th>
-                </tr>
-              </thead>
-              <tbody id="events-table-body">
-                <tr>
-                  <td colspan="9" style="text-align: center; padding: 20px;">Loading events...</td>
-                </tr>
-              </tbody>
-            </table>
+          <div class="events-section-header" id="events-section-header">
+            <h2>BTC Up/Down 15m Events</h2>
+            <span class="events-chevron" id="events-chevron">▼</span>
+          </div>
+          <div class="events-section-content" id="events-section-content">
+            <div id="events-error" class="error-message"></div>
+            <div class="events-table-container">
+              <table class="events-table">
+                <thead>
+                  <tr>
+                    <th>Title</th>
+                    <th>Start Date</th>
+                    <th>End Date</th>
+                    <th>Status</th>
+                    <th>Price to Beat</th>
+                    <th>Condition ID</th>
+                    <th>Question ID</th>
+                    <th>CLOB Token IDs</th>
+                    <th>Slug</th>
+                  </tr>
+                </thead>
+                <tbody id="events-table-body">
+                  <tr>
+                    <td colspan="9" style="text-align: center; padding: 20px;">Loading events...</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
 
