@@ -200,7 +200,14 @@ export class TradingManager {
 
   /**
    * Check both UP and DOWN tokens and place market order when price equals entry price
-   * Order is filled when UP or DOWN value exactly equals entryPrice
+   * 
+   * Entry Logic:
+   * - If yesTokenPrice reaches entryPrice → Fill position (UP direction)
+   * - If noTokenPrice reaches entryPrice → Fill position (DOWN direction)
+   * 
+   * After entry, monitoring continues in checkExitConditions():
+   * - UP: Monitor yesTokenPrice for stop loss (decrease) or profit target (increase)
+   * - DOWN: Monitor noTokenPrice for stop loss (decrease) or profit target (increase)
    */
   private async checkAndPlaceMarketOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
@@ -630,13 +637,18 @@ export class TradingManager {
 
   /**
    * Check exit conditions: profit target and stop loss
-   * Uses the same variables as entry condition (yesPricePercent, noPricePercent)
-   * For UP direction:
-   *   - Profit Target: Sell when UP value >= profit target
-   *   - Stop Loss: Sell when UP value <= stop loss (with adaptive selling)
-   * For DOWN direction:
-   *   - Profit Target: Sell when DOWN value >= profit target
-   *   - Stop Loss: Sell when DOWN value <= stop loss (with adaptive selling)
+   * 
+   * UP Direction (YES Token):
+   * - Entry: When yesTokenPrice reaches entryPrice → Fill position (UP direction)
+   * - Monitoring: Keep monitoring yesTokenPrice
+   * - Stop Loss: If yesTokenPrice decreases to stopLoss → Sell immediately (max shares)
+   * - Profit Target: If yesTokenPrice increases to profitTarget → Sell immediately (entire position)
+   * 
+   * DOWN Direction (NO Token):
+   * - Entry: When noTokenPrice reaches entryPrice → Fill position (DOWN direction)
+   * - Monitoring: Keep monitoring noTokenPrice
+   * - Stop Loss: If noTokenPrice decreases to stopLoss → Sell immediately (max shares)
+   * - Profit Target: If noTokenPrice increases to profitTarget → Sell immediately (entire position)
    */
   private async checkExitConditions(): Promise<void> {
     if (!this.status.currentPosition) {
@@ -714,32 +726,40 @@ export class TradingManager {
       });
 
       if (direction === 'UP') {
-        // UP direction: 
-        // - Profit target: when UP value >= profit target
-        // - Stop loss: when UP value <= stop loss (with adaptive selling)
+        // UP Direction Logic:
+        // - Entry: When yesTokenPrice reaches entryPrice → Fill position (UP direction)
+        // - Monitoring: Keep monitoring yesTokenPrice
+        // - Stop Loss: If yesTokenPrice decreases to stopLoss → Sell immediately (max shares)
+        // - Profit Target: If yesTokenPrice increases to profitTarget → Sell immediately (entire position)
         if (yesPricePercent >= profitTarget) {
-          console.log(`[TradingManager] ✅ UP profit target met: ${yesPricePercent.toFixed(2)} >= ${profitTarget.toFixed(2)}`);
+          console.log(`[TradingManager] ✅ UP profit target met: yesTokenPrice ${yesPricePercent.toFixed(2)} >= profitTarget ${profitTarget.toFixed(2)}`);
+          console.log(`[TradingManager] Selling entire UP position (max shares) at profit target`);
           await this.closePosition(`Profit target reached at ${yesPricePercent.toFixed(2)}`);
         } else if (yesPricePercent <= stopLoss) {
-          // UP price dropped to stop loss - try to sell immediately, use adaptive selling as fallback
-          console.log(`[TradingManager] ⚠️ UP stop loss triggered: yesPricePercent ${yesPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
+          // UP price decreased to stop loss - sell immediately (max shares)
+          console.log(`[TradingManager] ⚠️ UP stop loss triggered: yesTokenPrice ${yesPricePercent.toFixed(2)} decreased to stopLoss ${stopLoss.toFixed(2)}`);
+          console.log(`[TradingManager] Selling entire UP position (max shares) immediately to stop loss`);
           await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${yesPricePercent.toFixed(2)}`, stopLoss, false, yesPricePercent, noPricePercent);
         } else {
-          console.log(`[TradingManager] No exit condition met for UP: price ${yesPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`);
+          console.log(`[TradingManager] Monitoring UP position: yesTokenPrice ${yesPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`);
         }
       } else {
-        // DOWN direction:
-        // - Profit target: when DOWN value >= profit target
-        // - Stop loss: when DOWN value <= stop loss (with adaptive selling)
+        // DOWN Direction Logic:
+        // - Entry: When noTokenPrice reaches entryPrice → Fill position (DOWN direction)
+        // - Monitoring: Keep monitoring noTokenPrice
+        // - Stop Loss: If noTokenPrice decreases to stopLoss → Sell immediately (max shares)
+        // - Profit Target: If noTokenPrice increases to profitTarget → Sell immediately (entire position)
         if (noPricePercent >= profitTarget) {
-          console.log(`[TradingManager] ✅ DOWN profit target met: ${noPricePercent.toFixed(2)} >= ${profitTarget.toFixed(2)}`);
+          console.log(`[TradingManager] ✅ DOWN profit target met: noTokenPrice ${noPricePercent.toFixed(2)} >= profitTarget ${profitTarget.toFixed(2)}`);
+          console.log(`[TradingManager] Selling entire DOWN position (max shares) at profit target`);
           await this.closePosition(`Profit target reached at ${noPricePercent.toFixed(2)}`);
         } else if (noPricePercent <= stopLoss) {
-          // DOWN price dropped to stop loss - try to sell immediately, use adaptive selling as fallback
-          console.log(`[TradingManager] ⚠️ DOWN stop loss triggered: noPricePercent ${noPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
+          // DOWN price decreased to stop loss - sell immediately (max shares)
+          console.log(`[TradingManager] ⚠️ DOWN stop loss triggered: noTokenPrice ${noPricePercent.toFixed(2)} decreased to stopLoss ${stopLoss.toFixed(2)}`);
+          console.log(`[TradingManager] Selling entire DOWN position (max shares) immediately to stop loss`);
           await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${noPricePercent.toFixed(2)}`, stopLoss, true, yesPricePercent, noPricePercent);
         } else {
-          console.log(`[TradingManager] No exit condition met for DOWN: price ${noPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`);
+          console.log(`[TradingManager] Monitoring DOWN position: noTokenPrice ${noPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`);
         }
       }
 
@@ -751,11 +771,17 @@ export class TradingManager {
 
   /**
    * Close position with adaptive selling for stop loss
-   * Uses yesPricePercent and noPricePercent (same as entry/exit conditions)
-   * First tries to sell immediately at current market price
-   * If that fails, uses adaptive selling as fallback:
-   *   - For both UP and DOWN directions: Tries progressively lower prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
-   *   - This ensures quick exit to stop the loss
+   * 
+   * For UP Direction:
+   * - If yesTokenPrice decreases to stopLoss → Sell immediately (max shares)
+   * - Uses adaptive selling as fallback if immediate sell fails
+   * 
+   * For DOWN Direction:
+   * - If noTokenPrice decreases to stopLoss → Sell immediately (max shares)
+   * - Uses adaptive selling as fallback if immediate sell fails
+   * 
+   * Adaptive selling tries progressively lower prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
+   * to ensure quick exit and stop the loss
    */
   private async closePositionWithAdaptiveSelling(
     reason: string, 
@@ -977,8 +1003,13 @@ export class TradingManager {
 
   /**
    * Close current position with market order
-   * For large positions (>50 USD), splits sell orders into multiple trades
-   * Uses API if credentials are available, otherwise simulates
+   * 
+   * Sells the entire position (max shares) that was filled previously.
+   * For large positions (>50 USD), splits sell orders into multiple trades.
+   * 
+   * Used for:
+   * - Profit target reached: Sell entire position immediately
+   * - Stop loss triggered: Sell entire position immediately (via closePositionWithAdaptiveSelling)
    */
   private async closePosition(reason: string): Promise<void> {
     if (!this.status.currentPosition) {
