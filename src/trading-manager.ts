@@ -737,8 +737,8 @@ export class TradingManager {
    * Uses yesPricePercent and noPricePercent (same as entry/exit conditions)
    * First tries to sell immediately at current market price
    * If that fails, uses adaptive selling as fallback:
-   *   - For UP direction: Tries progressively lower prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
-   *   - For DOWN direction: Tries to sell at market price (price already dropped, just sell)
+   *   - For both UP and DOWN directions: Tries progressively lower prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
+   *   - This ensures quick exit to stop the loss
    */
   private async closePositionWithAdaptiveSelling(
     reason: string, 
@@ -796,17 +796,11 @@ export class TradingManager {
         currentPrice: currentPricePercent.toFixed(2),
       });
 
-      // For UP: try progressively lower prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
-      // For DOWN: price already dropped, just try to sell at market or slightly above stop loss
+      // For both UP and DOWN: try progressively lower prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
+      // This ensures we sell as quickly as possible to stop the loss
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        let targetPrice: number;
-        if (isDownDirection) {
-          // For DOWN: price dropped to stop loss, try to sell at stop loss or slightly above
-          targetPrice = stopLossPrice + (attempt * 0.5); // Try stopLoss, stopLoss+0.5, stopLoss+1, etc.
-        } else {
-          // For UP: try progressively lower prices
-          targetPrice = stopLossPrice - attempt; // stopLoss, stopLoss-1, stopLoss-2, etc.
-        }
+        // Both directions try lower prices: stopLoss, stopLoss-1, stopLoss-2, etc.
+        const targetPrice = stopLossPrice - attempt;
         
         if (targetPrice < 0 || targetPrice > 100) {
           console.warn('[TradingManager] Target price out of range, using market price');
@@ -822,11 +816,8 @@ export class TradingManager {
           // Use the current price from yesPricePercent/noPricePercent
           const currentPrice = isDownDirection ? noPricePercent : yesPricePercent;
           
-          // For UP: sell when price is at/below target (price dropped to stop loss)
-          // For DOWN: sell when price is at/above target (can sell at stop loss or slightly above)
-          const canSell = isDownDirection 
-            ? currentPrice >= targetPrice  // DOWN: can sell if price is at/above target
-            : currentPrice <= targetPrice; // UP: price dropped to/below target
+          // For both UP and DOWN: sell when price is at/below target (price dropped to stop loss)
+          const canSell = currentPrice <= targetPrice;
             
           if (canSell) {
             console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} meets target ${targetPrice.toFixed(2)}, proceeding with sale`);
@@ -835,8 +826,7 @@ export class TradingManager {
             await this.closePosition(`${reason} - Adaptive sell at ${currentPrice.toFixed(2)} (target was ${targetPrice.toFixed(2)})`);
             return;
           } else {
-            const directionText = isDownDirection ? 'below' : 'above';
-            console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} is ${directionText} target ${targetPrice.toFixed(2)}, will try ${isDownDirection ? 'higher' : 'lower'} price on next attempt`);
+            console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} is above target ${targetPrice.toFixed(2)}, will try lower price on next attempt`);
             await new Promise(resolve => setTimeout(resolve, 500));
           }
         } catch (error) {
