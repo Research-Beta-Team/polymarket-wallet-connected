@@ -813,7 +813,7 @@ export class StreamingPlatform {
         </div>
 
         <div class="orders-section" id="orders-section">
-          <h2>Active Orders</h2>
+          <h2>Orders</h2>
           <div class="orders-controls">
             <button id="refresh-orders" class="btn btn-secondary">Refresh Orders</button>
             <span id="orders-count" class="orders-count">Loading...</span>
@@ -1381,9 +1381,19 @@ export class StreamingPlatform {
 
       const orders = data.orders || [];
       console.log('[Orders] Fetched orders:', orders.length);
+      
+      // Count orders by status
+      const liveOrders = orders.filter((o: any) => o.status === 'LIVE').length;
+      const filledOrders = orders.filter((o: any) => 
+        o.status === 'FILLED' || o.status === 'EXECUTED' || o.status === 'CLOSED'
+      ).length;
 
       if (ordersCount) {
-        ordersCount.textContent = `${orders.length} active`;
+        if (orders.length === 0) {
+          ordersCount.textContent = 'No orders';
+        } else {
+          ordersCount.textContent = `${orders.length} total (${liveOrders} live, ${filledOrders} filled)`;
+        }
       }
 
       // Always render orders table with headers
@@ -1405,24 +1415,34 @@ export class StreamingPlatform {
             </thead>
             <tbody>
               ${orders.length === 0 
-                ? '<tr><td colspan="9" class="orders-empty-cell">No active orders</td></tr>'
-                : orders.map((order: any) => `
-                  <tr class="order-row" data-order-id="${order.id}">
-                    <td class="order-id">${order.id.substring(0, 8)}...</td>
-                    <td class="token-id">${order.asset_id?.substring(0, 10)}...</td>
-                    <td><span class="side-${order.side.toLowerCase()}">${order.side}</span></td>
-                    <td>${parseFloat(order.price || 0).toFixed(4)}</td>
-                    <td>${parseFloat(order.original_size || 0).toFixed(2)}</td>
-                    <td>${parseFloat(order.size_matched || 0).toFixed(2)}</td>
-                    <td><span class="status-badge status-${order.status.toLowerCase()}">${order.status}</span></td>
-                    <td>${new Date(order.created_at * 1000).toLocaleString()}</td>
-                    <td>
-                      <button class="btn-cancel-order" data-order-id="${order.id}" ${order.status !== 'LIVE' ? 'disabled' : ''}>
-                        Cancel
-                      </button>
-                    </td>
-                  </tr>
-                `).join('')
+                ? '<tr><td colspan="9" class="orders-empty-cell">No orders</td></tr>'
+                : orders.map((order: any) => {
+                    const orderStatus = (order.status || 'UNKNOWN').toUpperCase();
+                    const isFilled = orderStatus === 'FILLED' || orderStatus === 'EXECUTED' || orderStatus === 'CLOSED';
+                    const isLive = orderStatus === 'LIVE';
+                    const rowClass = isFilled ? 'order-row order-filled' : isLive ? 'order-row order-live' : 'order-row';
+                    const fillPercentage = order.original_size > 0 
+                      ? ((order.size_matched || 0) / order.original_size * 100).toFixed(1)
+                      : '0.0';
+                    
+                    return `
+                      <tr class="${rowClass}" data-order-id="${order.id}">
+                        <td class="order-id">${order.id ? order.id.substring(0, 8) + '...' : '--'}</td>
+                        <td class="token-id">${order.asset_id ? order.asset_id.substring(0, 10) + '...' : order.token_id ? order.token_id.substring(0, 10) + '...' : '--'}</td>
+                        <td><span class="side-${(order.side || '').toLowerCase()}">${order.side || '--'}</span></td>
+                        <td>${parseFloat(order.price || 0).toFixed(4)}</td>
+                        <td>${parseFloat(order.original_size || order.size || 0).toFixed(2)}</td>
+                        <td>${parseFloat(order.size_matched || order.filled_size || 0).toFixed(2)} (${fillPercentage}%)</td>
+                        <td><span class="status-badge status-${orderStatus.toLowerCase()}">${order.status || 'UNKNOWN'}</span></td>
+                        <td>${order.created_at ? new Date(order.created_at * 1000).toLocaleString() : order.created_at_iso || '--'}</td>
+                        <td>
+                          <button class="btn-cancel-order" data-order-id="${order.id}" ${!isLive ? 'disabled title="Order cannot be cancelled"' : ''}>
+                            ${isLive ? 'Cancel' : '--'}
+                          </button>
+                        </td>
+                      </tr>
+                    `;
+                  }).join('')
               }
             </tbody>
           </table>

@@ -1,3 +1,4 @@
+
 # Trading Bot Flow Examples
 
 This document provides detailed examples of how the automated trading bot works, including entry, position management, and exit scenarios.

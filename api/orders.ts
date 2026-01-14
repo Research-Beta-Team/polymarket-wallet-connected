@@ -135,18 +135,25 @@ export default async function handler(
         return orderMaker === proxyAddr;
       });
 
-      // Filter for LIVE orders only
-      const activeOrders = userOrders.filter((order: any) => {
-        return order.status === 'LIVE';
+      // Log order statuses for debugging
+      const statusCounts: Record<string, number> = {};
+      userOrders.forEach((order: any) => {
+        const status = order.status || 'UNKNOWN';
+        statusCounts[status] = (statusCounts[status] || 0) + 1;
       });
+      console.log('[Orders API] Order status breakdown:', statusCounts);
 
-      console.log('[Orders API] Active orders for user:', activeOrders.length);
+      // Show all orders (not just LIVE) so filled orders are visible
+      // This includes LIVE, FILLED, PARTIALLY_FILLED, etc.
+      const allUserOrders = userOrders;
+
+      console.log('[Orders API] All user orders:', allUserOrders.length);
 
       res.setHeader('Access-Control-Allow-Origin', '*');
       return res.status(200).json({
         success: true,
-        orders: activeOrders,
-        count: activeOrders.length,
+        orders: allUserOrders,
+        count: allUserOrders.length,
       });
     } catch (error) {
       console.error('[Orders API] Error fetching orders:', error);

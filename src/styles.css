@@ -1015,6 +1015,19 @@ header h1 {
   background-color: #f8f9fa;
 }
 
+.orders-table .order-row.order-filled {
+  background-color: #f0f8f0;
+  opacity: 0.8;
+}
+
+.orders-table .order-row.order-filled:hover {
+  background-color: #e8f5e8;
+}
+
+.orders-table .order-row.order-live {
+  background-color: #fff;
+}
+
 .order-id,
 .token-id {
   font-family: 'Courier New', monospace;

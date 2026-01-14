@@ -42,11 +42,17 @@ export interface TradingStatus {
     eventSlug: string;
     tokenId: string;
     side: 'BUY' | 'SELL';
-    entryPrice: number; // Price in 0-100 scale
-    size: number;
+    entryPrice: number; // Average entry price in 0-100 scale (weighted by size)
+    size: number; // Total position size in USD
     currentPrice?: number; // Price in 0-100 scale
     unrealizedProfit?: number;
     direction?: 'UP' | 'DOWN'; // Direction (UP = YES token, DOWN = NO token)
+    filledOrders?: Array<{
+      orderId: string;
+      price: number; // Fill price in 0-100 scale
+      size: number; // Size in USD
+      timestamp: number;
+    }>; // Track individual filled orders for large positions
   };
 }
 
