@@ -804,13 +804,15 @@ export class TradingManager {
       const profitTarget = this.strategyConfig.profitTargetPrice;
       const stopLoss = this.strategyConfig.stopLossPrice;
 
-      // Check exit conditions for all positions
+      // Check exit conditions for ALL positions
       // We exit ALL positions when ANY position meets exit condition
       let shouldExit = false;
       let exitReason = '';
       let useAdaptiveSelling = false;
       let isDownDirection = false;
+      let triggeringPosition: Position | null = null;
 
+      // First, update all positions' current prices and unrealized P/L
       for (const position of activePositions) {
         const direction = position.direction || 'UP';
         const currentPrice = direction === 'UP' ? yesPricePercent : noPricePercent;
@@ -819,32 +821,71 @@ export class TradingManager {
         position.currentPrice = currentPrice;
         const priceDiff = currentPrice - position.entryPrice;
         position.unrealizedProfit = (priceDiff / position.entryPrice) * position.size;
+      }
 
-        // Check exit conditions
+      // Then, check exit conditions for ALL positions
+      // Exit ALL positions if ANY position meets profit target or stop loss
+      for (const position of activePositions) {
+        const direction = position.direction || 'UP';
+        const currentPrice = direction === 'UP' ? yesPricePercent : noPricePercent;
+
+        // Check profit target condition
         if (currentPrice >= profitTarget) {
           shouldExit = true;
-          exitReason = `Profit target reached at ${currentPrice.toFixed(2)}`;
+          exitReason = `Profit target reached at ${currentPrice.toFixed(2)} (Position: ${position.id.substring(0, 8)}...)`;
+          triggeringPosition = position;
+          console.log(`[TradingManager] 🎯 Profit target triggered by position ${position.id.substring(0, 8)}... at price ${currentPrice.toFixed(2)}. Will close ALL ${activePositions.length} position(s).`);
           break; // Exit all positions on profit target
-        } else if (currentPrice <= stopLoss) {
+        }
+        
+        // Check stop loss condition
+        if (currentPrice <= stopLoss) {
           shouldExit = true;
-          exitReason = `Stop loss triggered at ${currentPrice.toFixed(2)}`;
+          exitReason = `Stop loss triggered at ${currentPrice.toFixed(2)} (Position: ${position.id.substring(0, 8)}...)`;
           useAdaptiveSelling = true;
           isDownDirection = direction === 'DOWN';
+          triggeringPosition = position;
+          console.log(`[TradingManager] 🛑 Stop loss triggered by position ${position.id.substring(0, 8)}... at price ${currentPrice.toFixed(2)}. Will close ALL ${activePositions.length} position(s).`);
           break; // Exit all positions on stop loss
         }
       }
 
       // Log exit condition check
-      console.log(`[TradingManager] Checking exit conditions for ${activePositions.length} position(s):`, {
-        yesPricePercent: yesPricePercent.toFixed(2),
-        noPricePercent: noPricePercent.toFixed(2),
-        profitTarget: profitTarget.toFixed(2),
-        stopLoss: stopLoss.toFixed(2),
-        shouldExit,
-        exitReason,
-      });
+      if (!shouldExit) {
+        // Only log detailed info if no exit condition was met (to reduce log noise)
+        console.log(`[TradingManager] Checking exit conditions for ${activePositions.length} position(s):`, {
+          yesPricePercent: yesPricePercent.toFixed(2),
+          noPricePercent: noPricePercent.toFixed(2),
+          profitTarget: profitTarget.toFixed(2),
+          stopLoss: stopLoss.toFixed(2),
+          positions: activePositions.map(p => ({
+            id: p.id.substring(0, 8),
+            direction: p.direction,
+            entryPrice: p.entryPrice.toFixed(2),
+            currentPrice: p.currentPrice?.toFixed(2),
+            unrealizedProfit: p.unrealizedProfit?.toFixed(2),
+          })),
+        });
+      }
 
       if (shouldExit) {
+        console.log(`[TradingManager] 🚨 EXIT CONDITION MET - Closing ALL ${activePositions.length} position(s):`, {
+          exitReason,
+          triggeringPosition: triggeringPosition ? {
+            id: triggeringPosition.id.substring(0, 8),
+            direction: triggeringPosition.direction,
+            entryPrice: triggeringPosition.entryPrice.toFixed(2),
+            currentPrice: triggeringPosition.currentPrice?.toFixed(2),
+          } : null,
+          allPositions: activePositions.map(p => ({
+            id: p.id.substring(0, 8),
+            direction: p.direction,
+            size: p.size.toFixed(2),
+            entryPrice: p.entryPrice.toFixed(2),
+          })),
+          useAdaptiveSelling,
+        });
+
         if (useAdaptiveSelling) {
           await this.closeAllPositionsWithAdaptiveSelling(exitReason, stopLoss, isDownDirection, yesPricePercent, noPricePercent);
         } else {
@@ -993,25 +1034,56 @@ export class TradingManager {
     this.isPlacingOrder = true;
     this.isPlacingSplitOrders = true;
 
+    const closedPositionIds: string[] = [];
+
     try {
-      console.log(`[TradingManager] Closing ${activePositions.length} position(s):`, {
+      const totalSize = activePositions.reduce((sum, p) => sum + p.size, 0);
+      console.log(`[TradingManager] 🚨 CLOSING ALL ${activePositions.length} POSITION(S) - ${reason}:`, {
         reason,
-        totalSize: activePositions.reduce((sum, p) => sum + p.size, 0).toFixed(2),
+        totalSize: totalSize.toFixed(2),
+        positions: activePositions.map((p, idx) => ({
+          index: idx + 1,
+          id: p.id.substring(0, 8) + '...',
+          direction: p.direction,
+          size: p.size.toFixed(2),
+          entryPrice: p.entryPrice.toFixed(2),
+          currentPrice: p.currentPrice?.toFixed(2),
+          unrealizedProfit: p.unrealizedProfit?.toFixed(2),
+        })),
       });
 
-      // Close each position
-      for (const position of activePositions) {
-        await this.closeSinglePosition(position, reason);
+      // Close each position and track which ones were successfully closed
+      for (let i = 0; i < activePositions.length; i++) {
+        const position = activePositions[i];
+        try {
+          console.log(`[TradingManager] [${i + 1}/${activePositions.length}] Closing position ${position.id.substring(0, 8)}... (${position.direction}, $${position.size.toFixed(2)})`);
+          await this.closeSinglePosition(position, reason);
+          closedPositionIds.push(position.id);
+          console.log(`[TradingManager] ✅ [${i + 1}/${activePositions.length}] Successfully closed position ${position.id.substring(0, 8)}...`);
+        } catch (error) {
+          console.error(`[TradingManager] ❌ [${i + 1}/${activePositions.length}] Failed to close position ${position.id.substring(0, 8)}...:`, error);
+          // Continue with next position even if one fails
+        }
       }
 
-      // Remove closed positions
-      this.positions = this.positions.filter(
-        p => p.eventSlug !== this.activeEvent?.slug
-      );
-      this.status.positions = [...this.positions];
-      this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+      // Remove only successfully closed positions
+      if (closedPositionIds.length > 0) {
+        this.positions = this.positions.filter(
+          p => !closedPositionIds.includes(p.id)
+        );
+        this.status.positions = [...this.positions];
+        this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+        
+        if (closedPositionIds.length === activePositions.length) {
+          console.log(`[TradingManager] ✅✅✅ SUCCESS: All ${closedPositionIds.length} position(s) closed successfully!`);
+        } else {
+          console.warn(`[TradingManager] ⚠️ PARTIAL: Closed ${closedPositionIds.length} of ${activePositions.length} position(s)`);
+          console.warn(`[TradingManager] ⚠️ Warning: ${activePositions.length - closedPositionIds.length} position(s) failed to close and will remain open`);
+        }
+      } else {
+        console.error(`[TradingManager] ❌❌❌ CRITICAL: No positions were successfully closed out of ${activePositions.length} attempted!`);
+      }
 
-      console.log('[TradingManager] ✅ All positions closed');
       this.notifyStatusUpdate();
     } catch (error) {
       console.error('[TradingManager] ❌ Error closing all positions:', error);
@@ -1056,13 +1128,21 @@ export class TradingManager {
         reason,
       });
 
-      // Try immediate sell first
+      // Try immediate sell first - temporarily clear flags so closeAllPositions can set them
       this.isPlacingOrder = false;
       this.isPlacingSplitOrders = false;
       await this.closeAllPositions(`${reason} - Immediate sell at ${currentPricePercent.toFixed(2)}`);
       
-      // If we reach here, immediate sell was attempted
-      // Adaptive selling as fallback
+      // Check if all positions were closed
+      const remainingPositions = this.getActivePositions();
+      if (remainingPositions.length === 0) {
+        console.log('[TradingManager] ✅ All positions closed successfully on immediate sell');
+        return;
+      }
+      
+      console.log(`[TradingManager] ⚠️ ${remainingPositions.length} position(s) still open, attempting adaptive selling...`);
+      
+      // Adaptive selling as fallback - set flags again
       this.isPlacingOrder = true;
       this.isPlacingSplitOrders = true;
       
@@ -1097,7 +1177,14 @@ export class TradingManager {
             this.isPlacingOrder = false;
             this.isPlacingSplitOrders = false;
             await this.closeAllPositions(`${reason} - Adaptive sell at ${currentPrice.toFixed(2)} (target was ${targetPrice.toFixed(2)})`);
-            return;
+            
+            // Check if all positions were closed
+            const remainingAfterAdaptive = this.getActivePositions();
+            if (remainingAfterAdaptive.length === 0) {
+              console.log('[TradingManager] ✅ All positions closed successfully via adaptive selling');
+              return;
+            }
+            console.log(`[TradingManager] ⚠️ ${remainingAfterAdaptive.length} position(s) still open after adaptive attempt ${attempt + 1}`);
           } else {
             console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} is above target ${targetPrice.toFixed(2)}, will try lower price on next attempt`);
             await new Promise(resolve => setTimeout(resolve, 500));
@@ -1109,10 +1196,23 @@ export class TradingManager {
       }
 
       // If all adaptive attempts failed, sell at current market price anyway
-      console.warn('[TradingManager] All adaptive attempts failed, selling all positions at current market price to stop loss');
-      this.isPlacingOrder = false;
-      this.isPlacingSplitOrders = false;
-      await this.closeAllPositions(`${reason} - All attempts failed, selling at market price to stop loss`);
+      const finalRemainingPositions = this.getActivePositions();
+      if (finalRemainingPositions.length > 0) {
+        console.warn(`[TradingManager] All adaptive attempts failed, selling ${finalRemainingPositions.length} remaining position(s) at current market price to stop loss`);
+        this.isPlacingOrder = false;
+        this.isPlacingSplitOrders = false;
+        await this.closeAllPositions(`${reason} - All attempts failed, selling at market price to stop loss`);
+        
+        // Final check
+        const stillRemaining = this.getActivePositions();
+        if (stillRemaining.length > 0) {
+          console.error(`[TradingManager] ❌ CRITICAL: ${stillRemaining.length} position(s) could not be closed after all attempts!`);
+        } else {
+          console.log('[TradingManager] ✅ All positions closed successfully on final attempt');
+        }
+      } else {
+        console.log('[TradingManager] ✅ All positions were closed during adaptive attempts');
+      }
     } catch (error) {
       console.error('[TradingManager] Error in adaptive selling for all positions:', error);
       this.isPlacingOrder = false;
@@ -1256,8 +1356,10 @@ export class TradingManager {
         numOrders: exitTrades.length,
       });
     } else {
-      console.error('[TradingManager] ❌ All sell orders failed for position:', position.id);
+      const errorMsg = `All sell orders failed for position ${position.id}`;
+      console.error(`[TradingManager] ❌ ${errorMsg}`);
       this.status.failedTrades++;
+      throw new Error(errorMsg);
     }
   }
 
