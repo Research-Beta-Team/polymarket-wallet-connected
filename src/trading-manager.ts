@@ -230,8 +230,8 @@ export class TradingManager {
   }
 
   /**
-   * Check both UP and DOWN tokens and place market order when price reaches entry price
-   * Order is filled when UP or DOWN value is >= entryPrice
+   * Check both UP and DOWN tokens and place market order when price equals entry price
+   * Order is filled when UP or DOWN value equals entryPrice (exact match)
    */
   private async checkAndPlaceMarketOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
@@ -274,47 +274,52 @@ export class TradingManager {
       const yesPricePercent = toPercentage(yesPrice);
       const noPricePercent = toPercentage(noPrice);
 
-      // Check if either token price is >= entry price
+      // Check if either token price equals entry price (exact match with small tolerance for floating point)
       let tokenToTrade: string | null = null;
       let direction: 'UP' | 'DOWN' | null = null;
+      const tolerance = 0.01; // Small tolerance for floating point comparison
 
       // Check UP token first (YES token)
-      if (yesPricePercent >= entryPrice) {
+      if (Math.abs(yesPricePercent - entryPrice) <= tolerance) {
         tokenToTrade = yesTokenId;
         direction = 'UP';
-        console.log(`[TradingManager] Entry condition met: yesTokenPrice ${yesPricePercent.toFixed(2)} >= entryPrice ${entryPrice.toFixed(2)} → Filling UP position`);
+        console.log(`[TradingManager] Entry condition met: yesTokenPrice ${yesPricePercent.toFixed(2)} == entryPrice ${entryPrice.toFixed(2)} → Filling UP position`);
       }
       // Check DOWN token (NO token) - only if UP token hasn't matched
-      else if (noPricePercent >= entryPrice) {
+      else if (Math.abs(noPricePercent - entryPrice) <= tolerance) {
         tokenToTrade = noTokenId;
         direction = 'DOWN';
-        console.log(`[TradingManager] Entry condition met: noTokenPrice ${noPricePercent.toFixed(2)} >= entryPrice ${entryPrice.toFixed(2)} → Filling DOWN position`);
+        console.log(`[TradingManager] Entry condition met: noTokenPrice ${noPricePercent.toFixed(2)} == entryPrice ${entryPrice.toFixed(2)} → Filling DOWN position`);
       } else {
-        // Price is below entry - mark that we can re-enter if it comes back
+        // Price is not equal to entry - mark that we can re-enter if it comes back to entry price
+        // Only set flag if price is BELOW entry (not just not equal)
         if (activePositions.length > 0) {
-          this.priceBelowEntry = true;
+          const currentPrice = yesPricePercent >= noPricePercent ? yesPricePercent : noPricePercent;
+          if (currentPrice < entryPrice) {
+            this.priceBelowEntry = true;
+          }
         }
         // Log why entry condition wasn't met for debugging
         console.log(`[TradingManager] Entry condition not met:`, {
           yesPricePercent: yesPricePercent.toFixed(2),
           noPricePercent: noPricePercent.toFixed(2),
           entryPrice: entryPrice.toFixed(2),
-          yesMet: yesPricePercent >= entryPrice,
-          noMet: noPricePercent >= entryPrice,
+          yesMet: Math.abs(yesPricePercent - entryPrice) <= tolerance,
+          noMet: Math.abs(noPricePercent - entryPrice) <= tolerance,
         });
         return;
       }
 
       // Check if we should enter (re-entry logic)
       if (activePositions.length > 0) {
-        // We have positions - check if price dropped below entry and came back
+        // We have positions - check if price dropped below entry and came back to exact entry price
         if (!this.priceBelowEntry) {
           // Price never dropped below entry, don't re-enter
-          console.log(`[TradingManager] Price still >= entry, not re-entering. Current positions: ${activePositions.length}`);
+          console.log(`[TradingManager] Price never dropped below entry, not re-entering. Current positions: ${activePositions.length}`);
           return;
         }
-        // Price dropped below entry and came back - allow re-entry
-        console.log(`[TradingManager] Price dropped below entry and came back, allowing re-entry. Current positions: ${activePositions.length}`);
+        // Price dropped below entry and came back to exact entry price - allow re-entry
+        console.log(`[TradingManager] Price dropped below entry and came back to exact entry price, allowing re-entry. Current positions: ${activePositions.length}`);
         this.priceBelowEntry = false; // Reset flag
       }
 
@@ -1331,6 +1336,38 @@ export class TradingManager {
 
   getStatus(): TradingStatus {
     return { ...this.status };
+  }
+
+  /**
+   * Manually close all positions (public method for UI)
+   */
+  async closeAllPositionsManually(reason: string = 'Manual sell'): Promise<void> {
+    await this.closeAllPositions(reason);
+  }
+
+  /**
+   * Manually close a specific position by ID (public method for UI)
+   */
+  async closePositionManually(positionId: string, reason: string = 'Manual sell'): Promise<void> {
+    const position = this.positions.find(p => p.id === positionId);
+    if (!position) {
+      throw new Error(`Position ${positionId} not found`);
+    }
+    
+    // Check if it's for the active event
+    if (position.eventSlug !== this.activeEvent?.slug) {
+      throw new Error('Position is not for the active event');
+    }
+
+    // Close this specific position
+    await this.closeSinglePosition(position, reason);
+    
+    // Remove from positions array
+    this.positions = this.positions.filter(p => p.id !== positionId);
+    this.status.positions = [...this.positions];
+    this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+    
+    this.notifyStatusUpdate();
   }
 
   private notifyStatusUpdate(): void {

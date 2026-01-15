@@ -871,7 +871,7 @@ export class StreamingPlatform {
                     <label>
                       Entry Price (0-100):
                       <input type="number" id="entry-price" value="96" min="0" max="100" step="0.01" />
-                      <small>Order is filled when UP or DOWN value is >= entryPrice</small>
+                      <small>Order is filled when UP or DOWN value equals entryPrice (exact match)</small>
                     </label>
                   </div>
                   <div class="config-item">
@@ -998,22 +998,28 @@ export class StreamingPlatform {
     // Update trading status display
     const statusDisplay = document.getElementById('trading-status-display');
     if (statusDisplay) {
-      const positionInfo = status.currentPosition
+      const positions = status.positions || [];
+      const positionInfo = positions.length > 0
         ? `
           <div class="position-info">
-            <h4>Current Position</h4>
-            <div class="position-details">
-              <div><strong>Event:</strong> ${status.currentPosition.eventSlug}</div>
-              <div><strong>Direction:</strong> ${status.currentPosition.direction || 'N/A'}</div>
-              <div><strong>Side:</strong> ${status.currentPosition.side}</div>
-              <div><strong>Entry Price:</strong> ${status.currentPosition.entryPrice.toFixed(2)}</div>
-              <div><strong>Size:</strong> $${status.currentPosition.size.toFixed(2)}</div>
-              ${status.currentPosition.currentPrice !== undefined ? `<div><strong>Current Price:</strong> ${status.currentPosition.currentPrice.toFixed(2)}</div>` : ''}
-              ${status.currentPosition.unrealizedProfit !== undefined ? `<div class="${status.currentPosition.unrealizedProfit >= 0 ? 'profit' : 'loss'}"><strong>Unrealized P/L:</strong> $${status.currentPosition.unrealizedProfit.toFixed(2)}</div>` : ''}
-            </div>
+            <h4>Open Positions (${positions.length})</h4>
+            ${status.totalPositionSize !== undefined ? `<div style="margin-bottom: 10px;"><strong>Total Position Size:</strong> $${status.totalPositionSize.toFixed(2)}</div>` : ''}
+            ${status.maxPositionSize !== undefined ? `<div style="margin-bottom: 10px;"><strong>Max Position Size:</strong> $${status.maxPositionSize.toFixed(2)} (50% of balance)</div>` : ''}
+            ${positions.map((position, index) => `
+              <div class="position-details" style="margin-bottom: 15px; padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
+                <div style="font-weight: bold; margin-bottom: 8px;">Position ${index + 1}</div>
+                <div><strong>Event:</strong> ${position.eventSlug}</div>
+                <div><strong>Direction:</strong> ${position.direction || 'N/A'}</div>
+                <div><strong>Side:</strong> ${position.side}</div>
+                <div><strong>Entry Price:</strong> ${position.entryPrice.toFixed(2)}</div>
+                <div><strong>Size:</strong> $${position.size.toFixed(2)}</div>
+                ${position.currentPrice !== undefined ? `<div><strong>Current Price:</strong> ${position.currentPrice.toFixed(2)}</div>` : ''}
+                ${position.unrealizedProfit !== undefined ? `<div class="${position.unrealizedProfit >= 0 ? 'profit' : 'loss'}"><strong>Unrealized P/L:</strong> $${position.unrealizedProfit.toFixed(2)}</div>` : ''}
+              </div>
+            `).join('')}
           </div>
         `
-        : '<div class="no-position">No open position</div>';
+        : '<div class="no-position">No open positions</div>';
 
       statusDisplay.innerHTML = `
         <div class="status-summary">
@@ -1540,8 +1546,11 @@ export class StreamingPlatform {
             const price = (e.target as HTMLButtonElement).getAttribute('data-price');
             
             if (isPosition) {
-              // Sell entire position
-              await this.sellPosition(tokenId || '', parseFloat(size || '0'), parseFloat(price || '0'));
+              // Sell specific position
+              const positionId = (e.target as HTMLButtonElement).getAttribute('data-position-id');
+              if (positionId) {
+                await this.sellPosition(positionId, tokenId || '', parseFloat(size || '0'), parseFloat(price || '0'));
+              }
             } else if (orderId && tokenId && size) {
               // Sell specific order
               await this.sellOrder(orderId, tokenId, parseFloat(size), parseFloat(price || '0'));
@@ -1624,100 +1633,45 @@ export class StreamingPlatform {
   }
 
   /**
-   * Sell entire position manually
-   * Uses the current position from trading manager
+   * Sell position manually (by position ID)
+   * Uses TradingManager's public method to close the position
    */
-  private async sellPosition(tokenId: string, size: number, entryPrice: number): Promise<void> {
+  private async sellPosition(positionId: string, tokenId: string, size: number, entryPrice: number): Promise<void> {
     if (!this.walletState.apiCredentials) {
       alert('API credentials not available');
       return;
     }
 
-    const position = this.tradingManager.getStatus().currentPosition;
+    // Get position details from trading manager
+    const status = this.tradingManager.getStatus();
+    const position = status.positions?.find(p => p.id === positionId);
+    
     if (!position) {
-      alert('No active position to sell');
+      alert('Position not found');
       return;
     }
 
-    if (!confirm(`Sell entire position?\nDirection: ${position.direction || 'N/A'}\nSize: $${size.toFixed(2)}\nEntry Price: ${entryPrice.toFixed(2)}`)) {
+    if (!confirm(`Sell position?\nPosition ID: ${positionId.substring(0, 8)}...\nDirection: ${position.direction || 'N/A'}\nSize: $${size.toFixed(2)}\nEntry Price: ${entryPrice.toFixed(2)}`)) {
       return;
     }
 
     try {
-      console.log('[Orders] Selling position:', {
+      console.log('[Orders] Selling position manually:', {
+        positionId,
         tokenId,
         size,
         entryPrice,
         direction: position.direction,
       });
 
-      // Use trading manager's closePosition method
-      // Since it's private, we'll trigger it via a synthetic exit condition
-      // For now, directly place a sell order
-      if (this.tradingManager.getApiCredentials()) {
-        const browserClobClient = (this.tradingManager as any).browserClobClient;
-        
-        if (browserClobClient) {
-          const { OrderType, Side } = await import('@polymarket/clob-client');
-          
-          // Get bid price for SELL orders
-          const bidPriceResponse = await browserClobClient.getPrice(tokenId, Side.SELL);
-          const bidPrice = parseFloat(bidPriceResponse.price);
-          
-          if (isNaN(bidPrice) || bidPrice <= 0 || bidPrice >= 1) {
-            throw new Error('Invalid market price for SELL');
-          }
-
-          // Get fee rate
-          let feeRateBps: number;
-          try {
-            feeRateBps = await browserClobClient.getFeeRateBps(tokenId);
-            if (!feeRateBps || feeRateBps === 0) {
-              feeRateBps = 1000;
-            }
-          } catch (error) {
-            feeRateBps = 1000;
-          }
-
-          // Calculate shares from USD size
-          const shares = size / bidPrice;
-
-          const marketOrder = {
-            tokenID: tokenId,
-            amount: shares,
-            side: Side.SELL,
-            feeRateBps: feeRateBps,
-          };
-
-          console.log('[Orders] Browser SELL position details:', {
-            bidPrice: bidPrice.toFixed(4),
-            bidPricePercent: (bidPrice * 100).toFixed(2),
-            positionSizeUSD: size,
-            shares: shares.toFixed(2),
-          });
-
-          const response = await browserClobClient.createAndPostMarketOrder(
-            marketOrder,
-            { negRisk: false },
-            OrderType.FAK
-          );
-
-          if (response?.orderID) {
-            console.log('[Orders] ✅ Position sold successfully:', response.orderID);
-            alert(`Position sold successfully!\nOrder ID: ${response.orderID.substring(0, 8)}...`);
-            
-            // Clear position and refresh orders list
-            // The position will be cleared when the sell order is filled
-            await this.fetchAndDisplayOrders();
-          } else {
-            throw new Error('Order submission failed - no order ID returned');
-          }
-        } else {
-          throw new Error('Browser ClobClient not available');
-        }
-      } else {
-        throw new Error('API credentials not available');
-      }
+      // Use TradingManager's public method to close the position
+      await this.tradingManager.closePositionManually(positionId, 'Manual sell');
+      
+      console.log('[Orders] ✅ Position sold successfully');
+      alert(`Position sold successfully!`);
+      
+      // Refresh orders list
+      await this.fetchAndDisplayOrders();
     } catch (error) {
       console.error('[Orders] ❌ Error selling position:', error);
       alert(`Failed to sell position: ${error instanceof Error ? error.message : 'Unknown error'}`);
@@ -1746,15 +1700,15 @@ export class StreamingPlatform {
         entryPrice,
       });
 
-      // Use trading manager to close position with this order's information
-      const position = this.tradingManager.getStatus().currentPosition;
+      // Check if there's an active position for this token
+      const status = this.tradingManager.getStatus();
+      const position = status.positions?.find(p => p.tokenId === tokenId);
       
-      if (position && position.tokenId === tokenId) {
+      if (position) {
         // If there's an active position for this token, use trading manager's closePosition
-        console.log('[Orders] Using TradingManager to close position');
-        // We need to trigger the closePosition method
-        // Since it's private, we'll call it through the trading manager's exit mechanism
-        // For now, let's directly place a sell order
+        console.log('[Orders] Found active position for this token, using TradingManager to close position');
+        // Note: sellOrder is for selling a specific order, not a position
+        // The position will be updated when the sell order is filled
       }
 
       // Place sell order directly
