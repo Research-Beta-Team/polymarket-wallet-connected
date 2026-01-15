@@ -3,36 +3,27 @@ import { EventManager } from './event-manager';
 import { TradingManager } from './trading-manager';
 import { getNext15MinIntervals } from './event-utils';
 import type { PriceUpdate, ConnectionStatus } from './types';
-import { isWalletInitializeResponse } from './types/wallet-types';
-import type { OrderResponse } from './types/api-types';
-import { validateStrategyConfig, parseNumberInput, parseOptionalNumberInput } from './utils/validation';
-import { ValidationError } from './utils/errors';
-import { StateManager, createInitialAppState, type AppState } from './utils/state-manager';
-import { setButtonLoading } from './utils/loading-states';
-import { formatErrorForAlert } from './utils/error-messages';
 
 export class StreamingPlatform {
   private wsClient: WebSocketClient;
   private eventManager: EventManager;
   private tradingManager: TradingManager;
-  private stateManager: StateManager<AppState>;
-  private maxHistorySize = 100;
-  private countdownInterval: number | null = null;
-  private priceUpdateInterval: number | null = null; // Interval for updating UP/DOWN prices
-  
-  // Legacy state properties (for backward compatibility during migration)
   private currentPrice: number | null = null;
   private priceHistory: Array<{ timestamp: number; value: number }> = [];
+  private maxHistorySize = 100;
   private currentStatus: ConnectionStatus = {
     connected: false,
     source: null,
     lastUpdate: null,
     error: null
   };
-  private eventPriceToBeat: Map<string, number> = new Map();
-  private eventLastPrice: Map<string, number> = new Map();
-  private upPrice: number | null = null;
-  private downPrice: number | null = null;
+  private countdownInterval: number | null = null;
+  private eventPriceToBeat: Map<string, number> = new Map(); // Map of event slug to price to beat
+  private eventLastPrice: Map<string, number> = new Map(); // Map of event slug to last price (from previous event end)
+  private upPrice: number | null = null; // Current UP token price (0-100 scale)
+  private downPrice: number | null = null; // Current DOWN token price (0-100 scale)
+  private priceUpdateInterval: number | null = null; // Interval for updating UP/DOWN prices
+  // Wallet connection state
   private walletState: {
     eoaAddress: string | null;
     proxyAddress: string | null;
@@ -59,7 +50,6 @@ export class StreamingPlatform {
     this.wsClient = new WebSocketClient();
     this.eventManager = new EventManager();
     this.tradingManager = new TradingManager();
-    this.stateManager = new StateManager<AppState>(createInitialAppState());
     this.eventManager.setOnEventsUpdated(() => {
       this.renderEventsTable();
     });
@@ -188,21 +178,15 @@ export class StreamingPlatform {
   }
 
   private handlePriceUpdate(update: PriceUpdate): void {
-    const newPrice = update.payload.value;
-    const currentHistory = this.stateManager.get('priceHistory');
-    const newHistory = [...currentHistory, {
+    this.currentPrice = update.payload.value;
+    this.priceHistory.push({
       timestamp: update.payload.timestamp,
       value: update.payload.value
-    }];
-
-    if (newHistory.length > this.maxHistorySize) {
-      newHistory.shift();
-    }
-
-    this.stateManager.setState({
-      currentPrice: newPrice,
-      priceHistory: newHistory,
     });
+
+    if (this.priceHistory.length > this.maxHistorySize) {
+      this.priceHistory.shift();
+    }
 
     // Check if we need to capture price for a newly active event
     this.capturePriceForActiveEvent();
@@ -287,10 +271,7 @@ export class StreamingPlatform {
   }
 
   private handleStatusChange(status: ConnectionStatus): void {
-    this.currentStatus = status; // Keep for backward compatibility
-    this.stateManager.setState({
-      connectionStatus: status,
-    });
+    this.currentStatus = status;
     this.updateUI();
   }
 
@@ -327,19 +308,17 @@ export class StreamingPlatform {
   }
 
   private updateUI(): void {
-    // Use currentStatus for backward compatibility
-    const connectionStatus = this.currentStatus;
     const statusElement = document.getElementById('connection-status');
     const errorElement = document.getElementById('error-message');
     
     if (statusElement) {
-      const isConnected = connectionStatus.connected;
+      const isConnected = this.currentStatus.connected;
       statusElement.textContent = isConnected ? 'Connected' : 'Disconnected';
       statusElement.className = isConnected ? 'status-connected' : 'status-disconnected';
     }
 
     if (errorElement) {
-      errorElement.textContent = connectionStatus.error || '';
+      errorElement.textContent = this.currentStatus.error || '';
     }
   }
 
@@ -516,8 +495,7 @@ export class StreamingPlatform {
         const contentType = downPriceResult.headers.get('content-type');
         if (contentType && contentType.includes('application/json')) {
           const downData = await downPriceResult.json();
-          const downPrice = downData.price ? parseFloat(downData.price) * 100 : null; // Convert to 0-100 scale
-          this.stateManager.setState({ downPrice });
+          this.downPrice = downData.price ? parseFloat(downData.price) * 100 : null; // Convert to 0-100 scale
         } else {
           console.warn('DOWN price response is not JSON, trying direct API call');
           // Try direct API call as fallback
@@ -559,7 +537,7 @@ export class StreamingPlatform {
         if (type === 'up') {
           this.upPrice = price;
         } else {
-          this.stateManager.setState({ downPrice: price });
+          this.downPrice = price;
         }
         this.updateUpDownPriceDisplay();
       }
@@ -893,7 +871,7 @@ export class StreamingPlatform {
                     <label>
                       Entry Price (0-100):
                       <input type="number" id="entry-price" value="96" min="0" max="100" step="0.01" />
-                      <small>Order is filled when UP or DOWN value is between entryPrice and entryPrice + 1 (range-based entry)</small>
+                      <small>Order is filled when UP or DOWN value is >= entryPrice</small>
                     </label>
                   </div>
                   <div class="config-item">
@@ -929,7 +907,6 @@ export class StreamingPlatform {
                   </label>
                 </div>
               </div>
-              <div id="validation-errors" class="validation-errors" style="display: none;"></div>
               <div class="config-actions">
                 <button id="save-strategy" class="btn btn-primary">Save Strategy</button>
               </div>
@@ -972,262 +949,26 @@ export class StreamingPlatform {
   }
 
   private saveStrategyConfig(): void {
-    const validationErrorsDiv = document.getElementById('validation-errors');
-    
-    // Clear previous errors
-    if (validationErrorsDiv) {
-      validationErrorsDiv.style.display = 'none';
-      validationErrorsDiv.innerHTML = '';
-    }
-    this.clearFieldErrors();
+    const enabled = (document.getElementById('strategy-enabled') as HTMLInputElement)?.checked || false;
+    const entryPrice = parseFloat((document.getElementById('entry-price') as HTMLInputElement)?.value || '96');
+    const profitTargetPrice = parseFloat((document.getElementById('profit-target-price') as HTMLInputElement)?.value || '100');
+    const stopLossPrice = parseFloat((document.getElementById('stop-loss-price') as HTMLInputElement)?.value || '91');
+    const tradeSize = parseFloat((document.getElementById('trade-size') as HTMLInputElement)?.value || '50');
+    const priceDifferenceInput = (document.getElementById('price-difference') as HTMLInputElement)?.value;
+    const priceDifference = priceDifferenceInput && priceDifferenceInput.trim() !== '' 
+      ? parseFloat(priceDifferenceInput) 
+      : null;
 
-    try {
-      const enabled = (document.getElementById('strategy-enabled') as HTMLInputElement)?.checked || false;
-      const entryPriceInput = (document.getElementById('entry-price') as HTMLInputElement)?.value;
-      const profitTargetPriceInput = (document.getElementById('profit-target-price') as HTMLInputElement)?.value;
-      const stopLossPriceInput = (document.getElementById('stop-loss-price') as HTMLInputElement)?.value;
-      const tradeSizeInput = (document.getElementById('trade-size') as HTMLInputElement)?.value;
-      const priceDifferenceInput = (document.getElementById('price-difference') as HTMLInputElement)?.value;
+    this.tradingManager.setStrategyConfig({
+      enabled,
+      entryPrice,
+      profitTargetPrice,
+      stopLossPrice,
+      tradeSize,
+      priceDifference,
+    });
 
-      // Parse inputs with validation
-      const entryPrice = parseNumberInput(entryPriceInput, 'entryPrice');
-      const profitTargetPrice = parseNumberInput(profitTargetPriceInput, 'profitTargetPrice');
-      const stopLossPrice = parseNumberInput(stopLossPriceInput, 'stopLossPrice');
-      const tradeSize = parseNumberInput(tradeSizeInput, 'tradeSize');
-      const priceDifference = parseOptionalNumberInput(priceDifferenceInput, 'priceDifference');
-
-      // Validate configuration
-      const validation = validateStrategyConfig({
-        entryPrice,
-        profitTargetPrice,
-        stopLossPrice,
-        tradeSize,
-        priceDifference,
-      });
-
-      if (!validation.isValid) {
-        this.showValidationErrors(validation.errors, validation.fieldErrors);
-        return;
-      }
-
-      // Save if valid
-      this.tradingManager.setStrategyConfig({
-        enabled,
-        entryPrice,
-        profitTargetPrice,
-        stopLossPrice,
-        tradeSize,
-        priceDifference,
-      });
-
-      alert('Strategy configuration saved!');
-    } catch (error) {
-      if (error instanceof ValidationError) {
-        const fieldErrors: Record<string, string> = {};
-        fieldErrors[error.context.field as string] = error.message;
-        this.showValidationErrors([error.message], fieldErrors);
-      } else {
-        this.showValidationErrors([error instanceof Error ? error.message : 'Unknown error occurred'], {});
-      }
-    }
-  }
-
-  /**
-   * Show validation errors in UI
-   */
-  private showValidationErrors(errors: string[], fieldErrors: Record<string, string>): void {
-    const validationErrorsDiv = document.getElementById('validation-errors');
-    if (!validationErrorsDiv) return;
-
-    // Show general errors
-    if (errors.length > 0) {
-      validationErrorsDiv.innerHTML = `
-        <div class="validation-error-list">
-          <strong>Validation Errors:</strong>
-          <ul>
-            ${errors.map(error => `<li>${error}</li>`).join('')}
-          </ul>
-        </div>
-      `;
-      validationErrorsDiv.style.display = 'block';
-    }
-
-    // Show field-specific errors
-    this.showFieldErrors(fieldErrors);
-  }
-
-  /**
-   * Show field-specific validation errors
-   */
-  private showFieldErrors(fieldErrors: Record<string, string>): void {
-    const fieldMap: Record<string, string> = {
-      entryPrice: 'entry-price',
-      profitTargetPrice: 'profit-target-price',
-      stopLossPrice: 'stop-loss-price',
-      tradeSize: 'trade-size',
-      priceDifference: 'price-difference',
-    };
-
-    for (const [field, error] of Object.entries(fieldErrors)) {
-      const inputId = fieldMap[field];
-      if (inputId) {
-        const input = document.getElementById(inputId) as HTMLInputElement;
-        if (input) {
-          input.classList.add('input-error');
-          // Add error message below input
-          let errorDiv = input.parentElement?.querySelector('.field-error') as HTMLElement;
-          if (!errorDiv) {
-            errorDiv = document.createElement('div');
-            errorDiv.className = 'field-error';
-            input.parentElement?.appendChild(errorDiv);
-          }
-          errorDiv.textContent = error;
-          errorDiv.style.display = 'block';
-        }
-      }
-    }
-  }
-
-  /**
-   * Clear all field errors
-   */
-  private clearFieldErrors(): void {
-    const fieldIds = ['entry-price', 'profit-target-price', 'stop-loss-price', 'trade-size', 'price-difference'];
-    for (const fieldId of fieldIds) {
-      const input = document.getElementById(fieldId) as HTMLInputElement;
-      if (input) {
-        input.classList.remove('input-error');
-        const errorDiv = input.parentElement?.querySelector('.field-error') as HTMLElement;
-        if (errorDiv) {
-          errorDiv.style.display = 'none';
-        }
-      }
-    }
-  }
-
-  /**
-   * Setup real-time validation on input fields
-   */
-  private setupInputValidation(): void {
-    const fieldIds = ['entry-price', 'profit-target-price', 'stop-loss-price', 'trade-size', 'price-difference'];
-    
-    for (const fieldId of fieldIds) {
-      const input = document.getElementById(fieldId) as HTMLInputElement;
-      if (input) {
-        // Validate on blur (when user leaves the field)
-        input.addEventListener('blur', () => {
-          this.validateField(fieldId);
-        });
-
-        // Clear error on input
-        input.addEventListener('input', () => {
-          input.classList.remove('input-error');
-          const errorDiv = input.parentElement?.querySelector('.field-error') as HTMLElement;
-          if (errorDiv) {
-            errorDiv.style.display = 'none';
-          }
-        });
-      }
-    }
-  }
-
-  /**
-   * Validate a single field
-   */
-  private validateField(fieldId: string): void {
-    const fieldMap: Record<string, string> = {
-      'entry-price': 'entryPrice',
-      'profit-target-price': 'profitTargetPrice',
-      'stop-loss-price': 'stopLossPrice',
-      'trade-size': 'tradeSize',
-      'price-difference': 'priceDifference',
-    };
-
-    const fieldName = fieldMap[fieldId];
-    if (!fieldName) return;
-
-    const input = document.getElementById(fieldId) as HTMLInputElement;
-    if (!input) return;
-
-    try {
-      const value = input.value.trim();
-      
-      if (fieldName === 'priceDifference') {
-        // Optional field
-        if (value === '') {
-          this.clearFieldError(fieldId);
-          return;
-        }
-        parseOptionalNumberInput(value, fieldName);
-      } else {
-        // Required field
-        if (value === '') {
-          throw new ValidationError(`${fieldName} is required`, fieldName, value);
-        }
-        parseNumberInput(value, fieldName);
-      }
-
-      // Get all current values for relationship validation
-      const entryPriceInput = (document.getElementById('entry-price') as HTMLInputElement)?.value;
-      const profitTargetPriceInput = (document.getElementById('profit-target-price') as HTMLInputElement)?.value;
-      const stopLossPriceInput = (document.getElementById('stop-loss-price') as HTMLInputElement)?.value;
-      const tradeSizeInput = (document.getElementById('trade-size') as HTMLInputElement)?.value;
-      const priceDifferenceInput = (document.getElementById('price-difference') as HTMLInputElement)?.value;
-
-      const config: Record<string, number | null> = {};
-      if (entryPriceInput) config.entryPrice = parseFloat(entryPriceInput);
-      if (profitTargetPriceInput) config.profitTargetPrice = parseFloat(profitTargetPriceInput);
-      if (stopLossPriceInput) config.stopLossPrice = parseFloat(stopLossPriceInput);
-      if (tradeSizeInput) config.tradeSize = parseFloat(tradeSizeInput);
-      if (priceDifferenceInput && priceDifferenceInput.trim()) {
-        config.priceDifference = parseFloat(priceDifferenceInput);
-      } else {
-        config.priceDifference = null;
-      }
-
-      const validation = validateStrategyConfig(config);
-      if (validation.fieldErrors[fieldName]) {
-        this.showFieldError(fieldId, validation.fieldErrors[fieldName]);
-      } else {
-        this.clearFieldError(fieldId);
-      }
-    } catch (error) {
-      if (error instanceof ValidationError) {
-        this.showFieldError(fieldId, error.message);
-      }
-    }
-  }
-
-  /**
-   * Show error for a single field
-   */
-  private showFieldError(fieldId: string, error: string): void {
-    const input = document.getElementById(fieldId) as HTMLInputElement;
-    if (!input) return;
-
-    input.classList.add('input-error');
-    let errorDiv = input.parentElement?.querySelector('.field-error') as HTMLElement;
-    if (!errorDiv) {
-      errorDiv = document.createElement('div');
-      errorDiv.className = 'field-error';
-      input.parentElement?.appendChild(errorDiv);
-    }
-    errorDiv.textContent = error;
-    errorDiv.style.display = 'block';
-  }
-
-  /**
-   * Clear error for a single field
-   */
-  private clearFieldError(fieldId: string): void {
-    const input = document.getElementById(fieldId) as HTMLInputElement;
-    if (!input) return;
-
-    input.classList.remove('input-error');
-    const errorDiv = input.parentElement?.querySelector('.field-error') as HTMLElement;
-    if (errorDiv) {
-      errorDiv.style.display = 'none';
-    }
+    alert('Strategy configuration saved!');
   }
 
   private renderTradingSection(): void {
@@ -1253,9 +994,6 @@ export class StreamingPlatform {
         ? config.priceDifference.toString() 
         : '';
     }
-
-    // Setup input validation after rendering (in case inputs were recreated)
-    this.setupInputValidation();
 
     // Update trading status display
     const statusDisplay = document.getElementById('trading-status-display');
@@ -1381,7 +1119,7 @@ export class StreamingPlatform {
       console.log('[Wallet] Response status:', response.status, response.statusText);
       
       // Try to parse response as JSON
-      let responseData: unknown;
+      let responseData: any;
       try {
         const responseText = await response.text();
         console.log('[Wallet] Response text:', responseText.substring(0, 200));
@@ -1403,14 +1141,13 @@ export class StreamingPlatform {
       
       if (!response.ok) {
         console.error('[Wallet] Error response:', responseData);
-        const errorData = responseData as { error?: string; message?: string };
-        const errorMessage = errorData?.error || errorData?.message || `Server error (${response.status})`;
+        const errorMessage = responseData?.error || responseData?.message || `Server error (${response.status})`;
         throw new Error(errorMessage);
       }
 
       console.log('[Wallet] Success:', responseData);
 
-      if (!isWalletInitializeResponse(responseData)) {
+      if (!responseData.eoaAddress || !responseData.proxyAddress) {
         console.error('[Wallet] Invalid data structure:', responseData);
         throw new Error('Invalid wallet data received: missing eoaAddress or proxyAddress');
       }
@@ -1489,8 +1226,6 @@ export class StreamingPlatform {
       this.walletState.isInitialized = false;
       this.renderWalletSection();
     } finally {
-      const initBtn = document.getElementById('initialize-session') as HTMLButtonElement;
-      setButtonLoading(initBtn, false);
       this.walletState.isLoading = false;
       this.renderWalletSection();
     }
@@ -1682,8 +1417,8 @@ export class StreamingPlatform {
       const position = this.tradingManager.getStatus().currentPosition;
       
       // Count orders by status
-      const liveOrders = (orders as OrderResponse[]).filter((o) => o.status === 'LIVE').length;
-      const filledOrders = (orders as OrderResponse[]).filter((o) => 
+      const liveOrders = orders.filter((o: any) => o.status === 'LIVE').length;
+      const filledOrders = orders.filter((o: any) => 
         o.status === 'FILLED' || o.status === 'EXECUTED' || o.status === 'CLOSED'
       ).length;
 
@@ -1875,7 +1610,7 @@ export class StreamingPlatform {
       await this.fetchAndDisplayOrders();
     } catch (error) {
       console.error('[Orders] ❌ Error cancelling order:', error);
-      alert(formatErrorForAlert(error));
+      alert(`Failed to cancel order: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -1911,7 +1646,7 @@ export class StreamingPlatform {
       // Since it's private, we'll trigger it via a synthetic exit condition
       // For now, directly place a sell order
       if (this.tradingManager.getApiCredentials()) {
-        const browserClobClient = this.tradingManager.getBrowserClobClient();
+        const browserClobClient = (this.tradingManager as any).browserClobClient;
         
         if (browserClobClient) {
           const { OrderType, Side } = await import('@polymarket/clob-client');
@@ -1976,7 +1711,7 @@ export class StreamingPlatform {
       }
     } catch (error) {
       console.error('[Orders] ❌ Error selling position:', error);
-      alert(formatErrorForAlert(error));
+      alert(`Failed to sell position: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 
@@ -2015,7 +1750,7 @@ export class StreamingPlatform {
 
       // Place sell order directly
       if (this.tradingManager.getApiCredentials()) {
-        const browserClobClient = this.tradingManager.getBrowserClobClient();
+        const browserClobClient = (this.tradingManager as any).browserClobClient;
         
         if (browserClobClient) {
           const { OrderType, Side } = await import('@polymarket/clob-client');
@@ -2113,7 +1848,7 @@ export class StreamingPlatform {
       }
     } catch (error) {
       console.error('[Orders] ❌ Error selling order:', error);
-      alert(formatErrorForAlert(error));
+      alert(`Failed to sell order: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   }
 

@@ -4,7 +4,6 @@
  */
 
 import { createBrowserClobClient } from './clob-client-browser';
-import type { ClobClient } from '@polymarket/clob-client';
 
 /**
  * Initialize browser ClobClient after wallet connection and API credentials are obtained
@@ -13,7 +12,7 @@ export async function initializeBrowserClobClient(
   privateKey: string,
   apiCredentials: { key: string; secret: string; passphrase: string },
   proxyAddress: string
-): Promise<ClobClient> {
+): Promise<any> {
   try {
     // Get signing URL (remote builder signing endpoint)
     const protocol = window.location.protocol;

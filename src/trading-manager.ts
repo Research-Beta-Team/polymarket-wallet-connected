@@ -2,9 +2,13 @@ import type { StrategyConfig, Trade, TradingStatus } from './trading-types';
 import { CLOBClientWrapper } from './clob-client';
 import type { EventDisplayData } from './event-manager';
 import type { ClobClient } from '@polymarket/clob-client';
-import { logger } from './utils/logger';
-import { TradingError, ErrorCode, OrderError, ValidationError, retryWithBackoff, isRetryableError, wrapError } from './utils/errors';
-import { toPercentage, fetchBothPrices, fetchBrowserPriceWithRetry, validateDecimalPrice } from './utils/price-utils';
+
+/**
+ * Converts Polymarket price from decimal (0-1) to percentage (0-100)
+ */
+function toPercentage(price: number): number {
+  return price * 100;
+}
 
 export class TradingManager {
   private clobClient: CLOBClientWrapper;
@@ -14,7 +18,7 @@ export class TradingManager {
   private status: TradingStatus;
   private onStatusUpdate: ((status: TradingStatus) => void) | null = null;
   private onTradeUpdate: ((trade: Trade) => void) | null = null;
-  private monitoringInterval: number | null = null;
+  private isMonitoring: boolean = false; // Flag to control continuous monitoring loop
   private activeEvent: EventDisplayData | null = null;
   private pendingLimitOrders: Map<string, Trade> = new Map(); // Map of tokenId -> pending limit order
   private currentPrice: number | null = null; // Current BTC/USD price
@@ -47,52 +51,8 @@ export class TradingManager {
   }
 
   setStrategyConfig(config: Partial<StrategyConfig>): void {
-    // Validate config before setting
-    this.validateStrategyConfig(config);
     this.strategyConfig = { ...this.strategyConfig, ...config };
     this.saveStrategyConfig();
-  }
-
-  /**
-   * Validate strategy configuration
-   */
-  private validateStrategyConfig(config: Partial<StrategyConfig>): void {
-    if (config.entryPrice !== undefined) {
-      if (config.entryPrice < 0 || config.entryPrice > 100) {
-        throw new ValidationError('Entry price must be between 0 and 100', 'entryPrice', config.entryPrice);
-      }
-    }
-
-    if (config.profitTargetPrice !== undefined) {
-      if (config.profitTargetPrice < 0 || config.profitTargetPrice > 100) {
-        throw new ValidationError('Profit target must be between 0 and 100', 'profitTargetPrice', config.profitTargetPrice);
-      }
-    }
-
-    if (config.stopLossPrice !== undefined) {
-      if (config.stopLossPrice < 0 || config.stopLossPrice > 100) {
-        throw new ValidationError('Stop loss must be between 0 and 100', 'stopLossPrice', config.stopLossPrice);
-      }
-    }
-
-    if (config.tradeSize !== undefined) {
-      if (config.tradeSize <= 0) {
-        throw new ValidationError('Trade size must be greater than 0', 'tradeSize', config.tradeSize);
-      }
-    }
-
-    // Validate logical relationships
-    if (config.entryPrice !== undefined && config.profitTargetPrice !== undefined) {
-      if (config.profitTargetPrice <= config.entryPrice) {
-        throw new ValidationError('Profit target must be greater than entry price', 'profitTargetPrice', config.profitTargetPrice);
-      }
-    }
-
-    if (config.entryPrice !== undefined && config.stopLossPrice !== undefined) {
-      if (config.stopLossPrice >= config.entryPrice) {
-        throw new ValidationError('Stop loss must be less than entry price', 'stopLossPrice', config.stopLossPrice);
-      }
-    }
   }
 
   getStrategyConfig(): StrategyConfig {
@@ -103,7 +63,7 @@ export class TradingManager {
     try {
       localStorage.setItem('tradingStrategy', JSON.stringify(this.strategyConfig));
     } catch (error) {
-      logger.warn('TradingManager', 'saveStrategyConfig', 'Failed to save strategy config', { error: String(error) });
+      console.warn('Failed to save strategy config:', error);
     }
   }
 
@@ -114,7 +74,7 @@ export class TradingManager {
         this.strategyConfig = { ...this.strategyConfig, ...JSON.parse(saved) };
       }
     } catch (error) {
-      logger.warn('TradingManager', 'loadStrategyConfig', 'Failed to load strategy config', { error: String(error) });
+      console.warn('Failed to load strategy config:', error);
     }
   }
 
@@ -153,9 +113,9 @@ export class TradingManager {
   setBrowserClobClient(clobClient: ClobClient | null): void {
     this.browserClobClient = clobClient;
     if (clobClient) {
-      logger.info('TradingManager', 'setBrowserClobClient', 'Browser ClobClient set - orders will be placed from browser (bypasses Cloudflare)');
+      console.log('[TradingManager] Browser ClobClient set - orders will be placed from browser (bypasses Cloudflare)');
     } else {
-      logger.info('TradingManager', 'setBrowserClobClient', 'Browser ClobClient cleared - will fall back to server-side API');
+      console.log('[TradingManager] Browser ClobClient cleared - will fall back to server-side API');
     }
   }
 
@@ -164,13 +124,6 @@ export class TradingManager {
    */
   getApiCredentials(): { key: string; secret: string; passphrase: string } | null {
     return this.apiCredentials;
-  }
-
-  /**
-   * Get browser ClobClient (for manual order placement)
-   */
-  getBrowserClobClient(): ClobClient | null {
-    return this.browserClobClient;
   }
 
   /**
@@ -246,70 +199,59 @@ export class TradingManager {
   }
 
   /**
-   * Check both UP and DOWN tokens and place market order when price is in entry range
-   * Order is filled when UP or DOWN value is >= entryPrice and <= entryPrice + 1
+   * Check both UP and DOWN tokens and place market order when price reaches entry price
+   * Order is filled when UP or DOWN value is >= entryPrice
    */
   private async checkAndPlaceMarketOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
-      if (!this.activeEvent) {
-        throw new TradingError('No active event', ErrorCode.NO_ACTIVE_EVENT);
+      const entryPrice = this.strategyConfig.entryPrice;
+
+      // Get current market prices for both tokens (BUY side for entry condition checking)
+      const [yesPrice, noPrice] = await Promise.all([
+        this.clobClient.getPrice(yesTokenId, 'BUY'),
+        this.clobClient.getPrice(noTokenId, 'BUY'),
+      ]);
+
+      if (!yesPrice || !noPrice) {
+        return;
       }
 
-      const entryPrice = this.strategyConfig.entryPrice;
-      const entryPriceMax = entryPrice + 1; // Maximum entry price (range-based)
+      // Convert to percentage scale (0-100)
+      const yesPricePercent = toPercentage(yesPrice);
+      const noPricePercent = toPercentage(noPrice);
 
-      // Get current market prices for both tokens (BUY side for entry condition checking) with retry
-      const { yesPricePercent, noPricePercent } = await fetchBothPrices(
-        this.clobClient,
-        yesTokenId,
-        noTokenId,
-        'BUY',
-        3
-      );
-
-      // Check if either token price is within entry range (entryPrice <= price <= entryPrice + 1)
+      // Check if either token price is >= entry price
       let tokenToTrade: string | null = null;
       let direction: 'UP' | 'DOWN' | null = null;
 
-      // Check UP token first (YES token) - range-based entry
-      if (yesPricePercent >= entryPrice && yesPricePercent <= entryPriceMax) {
+      // Check UP token first (YES token)
+      if (yesPricePercent >= entryPrice) {
         tokenToTrade = yesTokenId;
         direction = 'UP';
-        logger.info('TradingManager', 'checkAndPlaceMarketOrder', `Entry condition met: yesTokenPrice ${yesPricePercent.toFixed(2)} >= entryPrice ${entryPrice.toFixed(2)} (within range up to ${entryPriceMax.toFixed(2)}) → Filling UP position`, {
-          yesPricePercent: yesPricePercent.toFixed(2),
-          entryPrice: entryPrice.toFixed(2),
-          entryPriceMax: entryPriceMax.toFixed(2),
-          direction: 'UP',
-        });
+        console.log(`[TradingManager] Entry condition met: yesTokenPrice ${yesPricePercent.toFixed(2)} >= entryPrice ${entryPrice.toFixed(2)} → Filling UP position`);
       }
-      // Check DOWN token (NO token) - range-based entry, only if UP token hasn't matched
-      else if (noPricePercent >= entryPrice && noPricePercent <= entryPriceMax) {
+      // Check DOWN token (NO token) - only if UP token hasn't matched
+      else if (noPricePercent >= entryPrice) {
         tokenToTrade = noTokenId;
         direction = 'DOWN';
-        logger.info('TradingManager', 'checkAndPlaceMarketOrder', `Entry condition met: noTokenPrice ${noPricePercent.toFixed(2)} >= entryPrice ${entryPrice.toFixed(2)} (within range up to ${entryPriceMax.toFixed(2)}) → Filling DOWN position`, {
-          noPricePercent: noPricePercent.toFixed(2),
-          entryPrice: entryPrice.toFixed(2),
-          entryPriceMax: entryPriceMax.toFixed(2),
-          direction: 'DOWN',
-        });
+        console.log(`[TradingManager] Entry condition met: noTokenPrice ${noPricePercent.toFixed(2)} >= entryPrice ${entryPrice.toFixed(2)} → Filling DOWN position`);
       } else {
         // Log why entry condition wasn't met for debugging
-        logger.debug('TradingManager', 'checkAndPlaceMarketOrder', 'Entry condition not met', {
+        console.log(`[TradingManager] Entry condition not met:`, {
           yesPricePercent: yesPricePercent.toFixed(2),
           noPricePercent: noPricePercent.toFixed(2),
           entryPrice: entryPrice.toFixed(2),
-          entryPriceMax: entryPriceMax.toFixed(2),
-          yesInRange: yesPricePercent >= entryPrice && yesPricePercent <= entryPriceMax,
-          noInRange: noPricePercent >= entryPrice && noPricePercent <= entryPriceMax,
+          yesMet: yesPricePercent >= entryPrice,
+          noMet: noPricePercent >= entryPrice,
         });
       }
 
-      // Place market order when price is within entry range
+      // Place market order when price reaches entry price
       if (tokenToTrade && direction) {
         await this.placeMarketOrder(tokenToTrade, entryPrice, direction);
       }
     } catch (error) {
-      logger.error('TradingManager', 'checkAndPlaceMarketOrder', 'Error checking for market order placement', error);
+      console.error('[TradingManager] Error checking for market order placement:', error);
     }
   }
 
@@ -368,280 +310,99 @@ export class TradingManager {
   ): Promise<{ success: boolean; orderId?: string; fillPrice?: number; error?: string }> {
     try {
       if (!this.apiCredentials) {
-        throw new TradingError('No API credentials', ErrorCode.NO_API_CREDENTIALS);
+        return { success: false, error: 'No API credentials' };
       }
 
       if (this.browserClobClient) {
-        const browserClient = this.browserClobClient; // Store reference to avoid null check issues
-        return await retryWithBackoff(
-          async () => {
-            const { OrderType, Side } = await import('@polymarket/clob-client');
-            
-            // For BUY orders, use BUY side to get ask price
-            const askPrice = await fetchBrowserPriceWithRetry(browserClient, tokenId, 'BUY', 3, 500);
-            validateDecimalPrice(askPrice, 'askPrice');
+        const { OrderType, Side } = await import('@polymarket/clob-client');
+        
+        // For BUY orders, use BUY side to get ask price
+        const askPriceResponse = await this.browserClobClient.getPrice(tokenId, Side.BUY);
+        const askPrice = parseFloat(askPriceResponse.price);
+        
+        if (isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
+          return { success: false, error: 'Invalid market price' };
+        }
 
-            // Get fee rate with error handling
-            let feeRateBps: number;
-            try {
-              feeRateBps = await browserClient.getFeeRateBps(tokenId);
-              if (!feeRateBps || feeRateBps === 0) {
-                feeRateBps = 1000;
-              }
-            } catch (error) {
-              logger.warn('TradingManager', 'placeSingleMarketOrder', 'Failed to fetch fee rate, using default', { error: String(error) });
-              feeRateBps = 1000;
-            }
+        // Get fee rate
+        let feeRateBps: number;
+        try {
+          feeRateBps = await this.browserClobClient.getFeeRateBps(tokenId);
+          if (!feeRateBps || feeRateBps === 0) {
+            feeRateBps = 1000;
+          }
+        } catch (error) {
+          feeRateBps = 1000;
+        }
 
-            const marketOrder = {
-              tokenID: tokenId,
-              amount: orderSize,
-              side: Side.BUY,
-              feeRateBps: feeRateBps,
-            };
-
-            logger.debug('TradingManager', 'placeSingleMarketOrder', `Placing split order ${orderIndex + 1}/${totalOrders} at target price ${targetPrice.toFixed(2)}`, {
-              targetPrice: targetPrice.toFixed(2),
-              currentPrice: toPercentage(askPrice).toFixed(2),
-              orderSize: orderSize.toFixed(2),
-              orderIndex,
-              totalOrders,
-            });
-
-            const response = await browserClient.createAndPostMarketOrder(
-              marketOrder,
-              { negRisk: false },
-              OrderType.FAK
-            );
-
-            if (response?.orderID) {
-              return {
-                success: true,
-                orderId: response.orderID,
-                fillPrice: toPercentage(askPrice),
-              };
-            } else {
-              throw new OrderError('No order ID returned', { tokenId, orderIndex, totalOrders });
-            }
-          },
-          3, // maxRetries
-          1000, // initialDelay
-          2, // backoffMultiplier
-          (error) => isRetryableError(error) || error instanceof OrderError
-        );
-      } else {
-        // Fallback to server-side API with retry
-        return await retryWithBackoff(
-          async () => {
-            // For BUY orders, use BUY side to get ask price
-            const askPrice = await this.clobClient.getPrice(tokenId, 'BUY');
-            if (!askPrice || isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
-              throw new ValidationError('Invalid market price', 'askPrice', askPrice);
-            }
-
-            const shares = orderSize / askPrice;
-
-            const response = await fetch('/api/orders', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                tokenId,
-                size: shares,
-                side: 'BUY',
-                isMarketOrder: true,
-                apiCredentials: this.apiCredentials,
-                negRisk: false,
-              }),
-            });
-
-            if (!response.ok) {
-              const errorData = await response.json().catch(() => ({ error: 'Unknown error' }));
-              throw new OrderError(errorData.error || 'Order failed', { 
-                status: response.status,
-                tokenId,
-                orderIndex,
-              }, response.status >= 500);
-            }
-
-            const data = await response.json();
-            if (data.orderId) {
-              return {
-                success: true,
-                orderId: data.orderId,
-                fillPrice: toPercentage(askPrice),
-              };
-            } else {
-              throw new OrderError(data.error || 'Order failed', { tokenId, orderIndex });
-            }
-          },
-          3,
-          1000,
-          2,
-          (error) => isRetryableError(error)
-        );
-      }
-    } catch (error) {
-      const tradingError = wrapError(error, ErrorCode.ORDER_PLACEMENT_FAILED);
-      logger.error('TradingManager', 'placeSingleMarketOrder', 'Error placing single market order', tradingError, {
-        tokenId,
-        orderIndex,
-        totalOrders,
-      });
-      return {
-        success: false,
-        error: tradingError.getUserMessage(),
-      };
-    }
-  }
-
-  /**
-   * Handle simulated buy order (for testing without API credentials)
-   */
-  private handleSimulatedBuyOrder(tokenId: string, entryPrice: number, tradeSize: number, direction: 'UP' | 'DOWN'): void {
-    const trade: Trade = {
-      id: `market-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      eventSlug: this.activeEvent!.slug,
-      tokenId,
-      side: 'BUY',
-      size: tradeSize,
-      price: entryPrice,
-      timestamp: Date.now(),
-      status: 'filled',
-      transactionHash: `0x${Math.random().toString(16).substr(2, 64)}`,
-      reason: `Simulated market order (FAK) filled at ${entryPrice.toFixed(2)} (${direction})`,
-      orderType: 'MARKET',
-      direction,
-    };
-
-    this.status.currentPosition = {
-      eventSlug: trade.eventSlug,
-      tokenId: trade.tokenId,
-      side: trade.side,
-      size: tradeSize,
-      entryPrice: entryPrice,
-      direction,
-      filledOrders: [{ orderId: trade.transactionHash!, price: entryPrice, size: tradeSize, timestamp: Date.now() }],
-    };
-
-    this.trades.push(trade);
-    this.status.totalTrades++;
-    this.status.successfulTrades++;
-    this.notifyTradeUpdate(trade);
-    this.notifyStatusUpdate();
-  }
-
-  /**
-   * Execute buy order splits and return filled orders
-   */
-  private async executeBuyOrderSplits(
-    tokenId: string,
-    orderSplits: Array<{ price: number; size: number }>,
-    direction: 'UP' | 'DOWN',
-    isLargeOrder: boolean
-  ): Promise<Array<{ orderId: string; price: number; size: number; timestamp: number }>> {
-    const filledOrders: Array<{ orderId: string; price: number; size: number; timestamp: number }> = [];
-
-    for (let i = 0; i < orderSplits.length; i++) {
-      const split = orderSplits[i];
-      const result = await this.placeSingleMarketOrder(
-        tokenId,
-        split.price,
-        split.size,
-        direction,
-        i,
-        orderSplits.length
-      );
-
-      if (result.success && result.orderId && result.fillPrice !== undefined) {
-        filledOrders.push({
-          orderId: result.orderId,
-          price: result.fillPrice,
-          size: split.size,
-          timestamp: Date.now(),
-        });
-
-        // Create trade record for each filled order
-        const trade: Trade = {
-          id: `market-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 9)}`,
-          eventSlug: this.activeEvent!.slug,
-          tokenId,
-          side: 'BUY',
-          size: split.size,
-          price: result.fillPrice,
-          timestamp: Date.now(),
-          status: 'filled',
-          transactionHash: result.orderId,
-          reason: `Market order ${isLargeOrder ? `(${i + 1}/${orderSplits.length}) ` : ''}filled at ${result.fillPrice.toFixed(2)} (${direction})`,
-          orderType: 'MARKET',
-          direction,
+        const marketOrder = {
+          tokenID: tokenId,
+          amount: orderSize,
+          side: Side.BUY,
+          feeRateBps: feeRateBps,
         };
 
-        this.trades.push(trade);
-        this.status.totalTrades++;
-        this.notifyTradeUpdate(trade);
-      } else {
-        logger.error('TradingManager', 'executeBuyOrderSplits', `Split order ${i + 1}/${orderSplits.length} failed`, undefined, {
-          orderIndex: i + 1,
-          totalOrders: orderSplits.length,
-          error: result.error,
+        console.log(`[TradingManager] Placing split order ${orderIndex + 1}/${totalOrders} at target price ${targetPrice.toFixed(2)}:`, {
+          targetPrice: targetPrice.toFixed(2),
+          currentPrice: toPercentage(askPrice).toFixed(2),
+          orderSize: orderSize.toFixed(2),
         });
-      }
 
-      // Small delay between split orders to avoid rate limiting
-      if (i < orderSplits.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-    }
+        const response = await this.browserClobClient.createAndPostMarketOrder(
+          marketOrder,
+          { negRisk: false },
+          OrderType.FAK
+        );
 
-    return filledOrders;
-  }
+        if (response?.orderID) {
+          return {
+            success: true,
+            orderId: response.orderID,
+            fillPrice: toPercentage(askPrice),
+          };
+        } else {
+          return { success: false, error: 'No order ID returned' };
+        }
+      } else {
+        // Fallback to server-side API
+        // For BUY orders, use BUY side to get ask price
+        const askPrice = await this.clobClient.getPrice(tokenId, 'BUY');
+        if (!askPrice || isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
+          return { success: false, error: 'Invalid market price' };
+        }
 
-  /**
-   * Create position from filled orders
-   */
-  private createPositionFromFilledOrders(
-    tokenId: string,
-    filledOrders: Array<{ orderId: string; price: number; size: number; timestamp: number }>,
-    direction: 'UP' | 'DOWN'
-  ): void {
-    const totalFilledSize = filledOrders.reduce((sum, order) => sum + order.size, 0);
-    const avgEntryPrice = this.calculateWeightedAverageEntryPrice(
-      filledOrders.map(o => ({ price: o.price, size: o.size }))
-    );
+        const shares = orderSize / askPrice;
 
-    this.status.currentPosition = {
-      eventSlug: this.activeEvent!.slug,
-      tokenId,
-      side: 'BUY',
-      size: totalFilledSize,
-      entryPrice: avgEntryPrice,
-      direction,
-      filledOrders,
-    };
+        const response = await fetch('/api/orders', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            tokenId,
+            size: shares,
+            side: 'BUY',
+            isMarketOrder: true,
+            apiCredentials: this.apiCredentials,
+            negRisk: false,
+          }),
+        });
 
-    this.status.successfulTrades++;
-    logger.info('TradingManager', 'createPositionFromFilledOrders', 'Position created', {
-      direction,
-      totalSize: totalFilledSize.toFixed(2),
-      avgEntryPrice: avgEntryPrice.toFixed(2),
-      numOrders: filledOrders.length,
-    });
-  }
-
-  /**
-   * Schedule order fetch after buy orders are placed
-   */
-  private scheduleOrderFetch(): void {
-    logger.debug('TradingManager', 'scheduleOrderFetch', 'All buy orders placed, will fetch order details in 2 seconds');
-    setTimeout(() => {
-      if (this.onTradeUpdate && this.trades.length > 0) {
-        const lastTrade = this.trades[this.trades.length - 1];
-        if (lastTrade) {
-          logger.debug('TradingManager', 'scheduleOrderFetch', 'Triggering order fetch after buy orders');
-          this.onTradeUpdate(lastTrade);
+        const data = await response.json();
+        if (response.ok && data.orderId) {
+          return {
+            success: true,
+            orderId: data.orderId,
+            fillPrice: toPercentage(askPrice),
+          };
+        } else {
+          return { success: false, error: data.error || 'Order failed' };
         }
       }
-    }, 2000);
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      };
+    }
   }
 
   /**
@@ -652,7 +413,7 @@ export class TradingManager {
   private async placeMarketOrder(tokenId: string, entryPrice: number, direction: 'UP' | 'DOWN'): Promise<void> {
     // Prevent multiple simultaneous orders
     if (this.isPlacingOrder || this.isPlacingSplitOrders) {
-      logger.debug('TradingManager', 'placeMarketOrder', 'Order already being placed, skipping');
+      console.log('[TradingManager] Order already being placed, skipping...');
       return;
     }
 
@@ -664,7 +425,7 @@ export class TradingManager {
       const orderSplits = this.calculateOrderSplits(tradeSize, entryPrice);
       const isLargeOrder = tradeSize > 50;
 
-      logger.info('TradingManager', 'placeMarketOrder', 'Placing market order', {
+      console.log('[TradingManager] Placing market order:', {
         tokenId,
         direction,
         entryPrice,
@@ -675,24 +436,141 @@ export class TradingManager {
       });
 
       if (!this.apiCredentials) {
-        this.handleSimulatedBuyOrder(tokenId, entryPrice, tradeSize, direction);
+        // Simulation mode
+        const trade: Trade = {
+          id: `market-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          eventSlug: this.activeEvent!.slug,
+          tokenId,
+          side: 'BUY',
+          size: tradeSize,
+          price: entryPrice,
+          timestamp: Date.now(),
+          status: 'filled',
+          transactionHash: `0x${Math.random().toString(16).substr(2, 64)}`,
+          reason: `Simulated market order (FAK) filled at ${entryPrice.toFixed(2)} (${direction})`,
+          orderType: 'MARKET',
+          direction,
+        };
+
+        this.status.currentPosition = {
+          eventSlug: trade.eventSlug,
+          tokenId: trade.tokenId,
+          side: trade.side,
+          size: tradeSize,
+          entryPrice: entryPrice,
+          direction,
+          filledOrders: [{ orderId: trade.transactionHash!, price: entryPrice, size: tradeSize, timestamp: Date.now() }],
+        };
+
+        this.trades.push(trade);
+        this.status.totalTrades++;
+        this.status.successfulTrades++;
+        this.notifyTradeUpdate(trade);
+        this.notifyStatusUpdate();
         return;
       }
 
       // Place real orders (single or split)
-      const filledOrders = await this.executeBuyOrderSplits(tokenId, orderSplits, direction, isLargeOrder);
+      const filledOrders: Array<{ orderId: string; price: number; size: number; timestamp: number }> = [];
+      let totalFilledSize = 0;
+
+      for (let i = 0; i < orderSplits.length; i++) {
+        const split = orderSplits[i];
+        const result = await this.placeSingleMarketOrder(
+          tokenId,
+          split.price,
+          split.size,
+          direction,
+          i,
+          orderSplits.length
+        );
+
+        if (result.success && result.orderId && result.fillPrice !== undefined) {
+          filledOrders.push({
+            orderId: result.orderId,
+            price: result.fillPrice,
+            size: split.size,
+            timestamp: Date.now(),
+          });
+          totalFilledSize += split.size;
+
+          // Create trade record for each filled order
+          const trade: Trade = {
+            id: `market-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 9)}`,
+            eventSlug: this.activeEvent!.slug,
+            tokenId,
+            side: 'BUY',
+            size: split.size,
+            price: result.fillPrice,
+            timestamp: Date.now(),
+            status: 'filled',
+            transactionHash: result.orderId,
+            reason: `Market order ${isLargeOrder ? `(${i + 1}/${orderSplits.length}) ` : ''}filled at ${result.fillPrice.toFixed(2)} (${direction})`,
+            orderType: 'MARKET',
+            direction,
+          };
+
+          this.trades.push(trade);
+          this.status.totalTrades++;
+          this.notifyTradeUpdate(trade);
+        } else {
+          console.error(`[TradingManager] ❌ Split order ${i + 1}/${orderSplits.length} failed:`, result.error);
+          // Continue with other orders even if one fails
+        }
+
+        // Small delay between split orders to avoid rate limiting
+        if (i < orderSplits.length - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
 
       if (filledOrders.length > 0) {
-        this.createPositionFromFilledOrders(tokenId, filledOrders, direction);
-        this.scheduleOrderFetch();
+        // Calculate weighted average entry price
+        const avgEntryPrice = this.calculateWeightedAverageEntryPrice(
+          filledOrders.map(o => ({ price: o.price, size: o.size }))
+        );
+
+        // Create or update position
+        this.status.currentPosition = {
+          eventSlug: this.activeEvent!.slug,
+          tokenId,
+          side: 'BUY',
+          size: totalFilledSize,
+          entryPrice: avgEntryPrice,
+          direction,
+          filledOrders,
+        };
+
+        this.status.successfulTrades++;
+        console.log('[TradingManager] ✅ Position created:', {
+          direction,
+          totalSize: totalFilledSize.toFixed(2),
+          avgEntryPrice: avgEntryPrice.toFixed(2),
+          numOrders: filledOrders.length,
+        });
+        
+        // After all orders are placed, fetch order details to show in orders table
+        // Delay to ensure orders are registered in the system
+        console.log('[TradingManager] All buy orders placed, will fetch order details in 2 seconds...');
+        setTimeout(() => {
+          // Trigger order fetch via trade update callback
+          if (this.onTradeUpdate && filledOrders.length > 0) {
+            // Create a synthetic trade update to trigger order fetch
+            const lastTrade = this.trades[this.trades.length - 1];
+            if (lastTrade) {
+              console.log('[TradingManager] Triggering order fetch after buy orders...');
+              this.onTradeUpdate(lastTrade);
+            }
+          }
+        }, 2000); // 2 second delay to ensure orders are registered
       } else {
-        logger.error('TradingManager', 'placeMarketOrder', 'All orders failed');
+        console.error('[TradingManager] ❌ All orders failed');
         this.status.failedTrades++;
       }
 
       this.notifyStatusUpdate();
     } catch (error) {
-      logger.error('TradingManager', 'placeMarketOrder', 'Error placing market order', error);
+      console.error('[TradingManager] ❌ Error placing market order:', error);
       this.status.failedTrades++;
     } finally {
       this.isPlacingOrder = false;
@@ -751,16 +629,13 @@ export class TradingManager {
         // Update trade with direction
         pendingOrder.direction = direction;
 
-        logger.info('TradingManager', 'checkLimitOrderFill', `Limit order filled: ${pendingOrder.id} at ${currentPricePercent.toFixed(2)}`, {
-          orderId: pendingOrder.id,
-          fillPrice: currentPricePercent.toFixed(2),
-        });
+        console.log(`Limit order filled: ${pendingOrder.id} at ${currentPricePercent.toFixed(2)}`);
 
         this.notifyTradeUpdate(pendingOrder);
         this.notifyStatusUpdate();
       }
     } catch (error) {
-      logger.error('TradingManager', 'checkLimitOrderFill', 'Error checking limit order fill', error);
+      console.error('Error checking limit order fill:', error);
     }
   }
 
@@ -796,14 +671,19 @@ export class TradingManager {
         return;
       }
 
-      // Get current market prices for both tokens (same as entry condition) with retry
-      const { yesPricePercent, noPricePercent } = await fetchBothPrices(
-        this.clobClient,
-        yesTokenId,
-        noTokenId,
-        'BUY',
-        3
-      );
+      // Get current market prices for both tokens (same as entry condition)
+      const [yesPrice, noPrice] = await Promise.all([
+        this.clobClient.getPrice(yesTokenId, 'BUY'),
+        this.clobClient.getPrice(noTokenId, 'BUY'),
+      ]);
+
+      if (!yesPrice || !noPrice) {
+        return;
+      }
+
+      // Convert to percentage scale (0-100) - same variables as entry condition
+      const yesPricePercent = toPercentage(yesPrice);
+      const noPricePercent = toPercentage(noPrice);
 
       const entryPrice = this.status.currentPosition.entryPrice;
       const profitTarget = this.strategyConfig.profitTargetPrice;
@@ -835,7 +715,7 @@ export class TradingManager {
 
       // Check exit conditions based on direction using yesPricePercent/noPricePercent
       // Add debug logging to track condition checks
-      logger.debug('TradingManager', 'checkExitConditions', 'Checking exit conditions', {
+      console.log(`[TradingManager] Checking exit conditions:`, {
         direction,
         yesPricePercent: yesPricePercent.toFixed(2),
         noPricePercent: noPricePercent.toFixed(2),
@@ -849,143 +729,35 @@ export class TradingManager {
         // - Profit target: when UP value >= profit target
         // - Stop loss: when UP value <= stop loss (with adaptive selling)
         if (yesPricePercent >= profitTarget) {
-          logger.info('TradingManager', 'checkExitConditions', `UP profit target met: ${yesPricePercent.toFixed(2)} >= ${profitTarget.toFixed(2)}`, {
-            direction: 'UP',
-            yesPricePercent: yesPricePercent.toFixed(2),
-            profitTarget: profitTarget.toFixed(2),
-          });
+          console.log(`[TradingManager] ✅ UP profit target met: ${yesPricePercent.toFixed(2)} >= ${profitTarget.toFixed(2)}`);
           await this.closePosition(`Profit target reached at ${yesPricePercent.toFixed(2)}`);
         } else if (yesPricePercent <= stopLoss) {
           // UP price dropped to stop loss - try to sell immediately, use adaptive selling as fallback
-          logger.warn('TradingManager', 'checkExitConditions', `UP stop loss triggered: yesPricePercent ${yesPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`, {
-            direction: 'UP',
-            yesPricePercent: yesPricePercent.toFixed(2),
-            stopLoss: stopLoss.toFixed(2),
-          });
+          console.log(`[TradingManager] ⚠️ UP stop loss triggered: yesPricePercent ${yesPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
           await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${yesPricePercent.toFixed(2)}`, stopLoss, false, yesPricePercent, noPricePercent);
         } else {
-          logger.debug('TradingManager', 'checkExitConditions', `No exit condition met for UP: price ${yesPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`, {
-            direction: 'UP',
-            yesPricePercent: yesPricePercent.toFixed(2),
-            profitTarget: profitTarget.toFixed(2),
-            stopLoss: stopLoss.toFixed(2),
-          });
+          console.log(`[TradingManager] No exit condition met for UP: price ${yesPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`);
         }
       } else {
         // DOWN direction:
         // - Profit target: when DOWN value >= profit target
         // - Stop loss: when DOWN value <= stop loss (with adaptive selling)
         if (noPricePercent >= profitTarget) {
-          logger.info('TradingManager', 'checkExitConditions', `DOWN profit target met: ${noPricePercent.toFixed(2)} >= ${profitTarget.toFixed(2)}`, {
-            direction: 'DOWN',
-            noPricePercent: noPricePercent.toFixed(2),
-            profitTarget: profitTarget.toFixed(2),
-          });
+          console.log(`[TradingManager] ✅ DOWN profit target met: ${noPricePercent.toFixed(2)} >= ${profitTarget.toFixed(2)}`);
           await this.closePosition(`Profit target reached at ${noPricePercent.toFixed(2)}`);
         } else if (noPricePercent <= stopLoss) {
           // DOWN price dropped to stop loss - try to sell immediately, use adaptive selling as fallback
-          logger.warn('TradingManager', 'checkExitConditions', `DOWN stop loss triggered: noPricePercent ${noPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`, {
-            direction: 'DOWN',
-            noPricePercent: noPricePercent.toFixed(2),
-            stopLoss: stopLoss.toFixed(2),
-          });
+          console.log(`[TradingManager] ⚠️ DOWN stop loss triggered: noPricePercent ${noPricePercent.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}`);
           await this.closePositionWithAdaptiveSelling(`Stop loss triggered at ${noPricePercent.toFixed(2)}`, stopLoss, true, yesPricePercent, noPricePercent);
         } else {
-          logger.debug('TradingManager', 'checkExitConditions', `No exit condition met for DOWN: price ${noPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`, {
-            direction: 'DOWN',
-            noPricePercent: noPricePercent.toFixed(2),
-            profitTarget: profitTarget.toFixed(2),
-            stopLoss: stopLoss.toFixed(2),
-          });
+          console.log(`[TradingManager] No exit condition met for DOWN: price ${noPricePercent.toFixed(2)} (target: ${profitTarget.toFixed(2)}, stop: ${stopLoss.toFixed(2)})`);
         }
       }
 
       this.notifyStatusUpdate();
     } catch (error) {
-      logger.error('TradingManager', 'checkExitConditions', 'Error checking exit conditions', error);
+      console.error('Error checking exit conditions:', error);
     }
-  }
-
-  /**
-   * Attempt immediate sell at current market price
-   */
-  private async attemptImmediateSell(
-    reason: string,
-    currentPricePercent: number
-  ): Promise<void> {
-    logger.info('TradingManager', 'attemptImmediateSell', `Attempting immediate sell at current market price: ${currentPricePercent.toFixed(2)}`, {
-      currentPrice: currentPricePercent.toFixed(2),
-    });
-    
-    this.isPlacingOrder = false;
-    this.isPlacingSplitOrders = false;
-    await this.closePosition(`${reason} - Immediate sell at ${currentPricePercent.toFixed(2)}`);
-  }
-
-  /**
-   * Attempt adaptive sell with progressively lower prices
-   */
-  private async attemptAdaptiveSell(
-    reason: string,
-    stopLossPrice: number,
-    isDownDirection: boolean,
-    yesPricePercent: number,
-    noPricePercent: number
-  ): Promise<boolean> {
-    const maxAttempts = 5;
-    logger.info('TradingManager', 'attemptAdaptiveSell', 'Using adaptive selling as fallback', {
-      stopLossPrice,
-      maxAttempts,
-      isDownDirection,
-    });
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const targetPrice = stopLossPrice - attempt;
-      
-      if (targetPrice < 0 || targetPrice > 100) {
-        logger.warn('TradingManager', 'attemptAdaptiveSell', 'Target price out of range, using market price', {
-          targetPrice,
-          attempt: attempt + 1,
-        });
-        return false;
-      }
-
-      try {
-        logger.debug('TradingManager', 'attemptAdaptiveSell', `Adaptive attempt ${attempt + 1}/${maxAttempts}: Trying to sell at price ${targetPrice.toFixed(2)}`, {
-          attempt: attempt + 1,
-          maxAttempts,
-          targetPrice: targetPrice.toFixed(2),
-        });
-        
-        const currentPrice = isDownDirection ? noPricePercent : yesPricePercent;
-        const canSell = currentPrice <= targetPrice;
-          
-        if (canSell) {
-          logger.info('TradingManager', 'attemptAdaptiveSell', `Current price ${currentPrice.toFixed(2)} meets target ${targetPrice.toFixed(2)}, proceeding with sale`, {
-            currentPrice: currentPrice.toFixed(2),
-            targetPrice: targetPrice.toFixed(2),
-          });
-          this.isPlacingOrder = false;
-          this.isPlacingSplitOrders = false;
-          await this.closePosition(`${reason} - Adaptive sell at ${currentPrice.toFixed(2)} (target was ${targetPrice.toFixed(2)})`);
-          return true;
-        } else {
-          logger.debug('TradingManager', 'attemptAdaptiveSell', `Current price ${currentPrice.toFixed(2)} is above target ${targetPrice.toFixed(2)}, will try lower price on next attempt`, {
-            currentPrice: currentPrice.toFixed(2),
-            targetPrice: targetPrice.toFixed(2),
-          });
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
-      } catch (error) {
-        logger.error('TradingManager', 'attemptAdaptiveSell', `Error on adaptive attempt ${attempt + 1}`, error, {
-          attempt: attempt + 1,
-          maxAttempts,
-        });
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-    }
-
-    return false;
   }
 
   /**
@@ -1009,7 +781,7 @@ export class TradingManager {
 
     // Prevent multiple simultaneous exit orders
     if (this.isPlacingOrder || this.isPlacingSplitOrders) {
-      logger.debug('TradingManager', 'closePositionWithAdaptiveSelling', 'Exit order already being placed, skipping');
+      console.log('[TradingManager] Exit order already being placed, skipping...');
       return;
     }
 
@@ -1017,41 +789,87 @@ export class TradingManager {
     this.isPlacingSplitOrders = true;
 
     try {
+      // Use the appropriate price based on direction (same variables as entry/exit conditions)
       const currentPricePercent = isDownDirection ? noPricePercent : yesPricePercent;
       
-      logger.warn('TradingManager', 'closePositionWithAdaptiveSelling', 'Stop loss triggered - attempting immediate sell', {
+      console.log('[TradingManager] Stop loss triggered - attempting immediate sell:', {
         stopLossPrice,
         direction: isDownDirection ? 'DOWN' : 'UP',
         currentPrice: currentPricePercent.toFixed(2),
         reason,
       });
 
-      // Try immediate sell first
-      await this.attemptImmediateSell(reason, currentPricePercent);
+      // First, try to sell immediately at current market price using yesPricePercent/noPricePercent
+      console.log(`[TradingManager] Attempting immediate sell at current market price: ${currentPricePercent.toFixed(2)}`);
       
-      // If immediate sell didn't work, try adaptive selling
+      // Try immediate sell first
+      this.isPlacingOrder = false;
+      this.isPlacingSplitOrders = false;
+      await this.closePosition(`${reason} - Immediate sell at ${currentPricePercent.toFixed(2)}`);
+      
+      // If we reach here, immediate sell was attempted
+      // Adaptive selling below uses yesPricePercent/noPricePercent for consistency
+      // Note: In practice, closePosition should handle the sell, but we keep adaptive logic
+      // as a safety mechanism that uses the same price variables
+      
+      // Adaptive selling as fallback (uses same variables: yesPricePercent/noPricePercent)
       this.isPlacingOrder = true;
       this.isPlacingSplitOrders = true;
       
-      const adaptiveSuccess = await this.attemptAdaptiveSell(
-        reason,
+      const maxAttempts = 5;
+      console.log('[TradingManager] Using adaptive selling as fallback:', {
         stopLossPrice,
+        maxAttempts,
         isDownDirection,
-        yesPricePercent,
-        noPricePercent
-      );
+        currentPrice: currentPricePercent.toFixed(2),
+      });
 
-      // If all adaptive attempts failed, sell at current market price anyway
-      if (!adaptiveSuccess) {
-        logger.warn('TradingManager', 'closePositionWithAdaptiveSelling', 'All adaptive attempts failed, selling at current market price to stop loss', {
-          maxAttempts: 5,
-        });
-        this.isPlacingOrder = false;
-        this.isPlacingSplitOrders = false;
-        await this.closePosition(`${reason} - All attempts failed, selling at market price to stop loss`);
+      // For both UP and DOWN: try progressively lower prices (stopLoss, stopLoss-1, stopLoss-2, etc.)
+      // This ensures we sell as quickly as possible to stop the loss
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        // Both directions try lower prices: stopLoss, stopLoss-1, stopLoss-2, etc.
+        const targetPrice = stopLossPrice - attempt;
+        
+        if (targetPrice < 0 || targetPrice > 100) {
+          console.warn('[TradingManager] Target price out of range, using market price');
+          this.isPlacingOrder = false;
+          this.isPlacingSplitOrders = false;
+          await this.closePosition(reason);
+          return;
+        }
+
+        try {
+          console.log(`[TradingManager] Adaptive attempt ${attempt + 1}/${maxAttempts}: Trying to sell at price ${targetPrice.toFixed(2)}`);
+          
+          // Use the current price from yesPricePercent/noPricePercent
+          const currentPrice = isDownDirection ? noPricePercent : yesPricePercent;
+          
+          // For both UP and DOWN: sell when price is at/below target (price dropped to stop loss)
+          const canSell = currentPrice <= targetPrice;
+            
+          if (canSell) {
+            console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} meets target ${targetPrice.toFixed(2)}, proceeding with sale`);
+            this.isPlacingOrder = false;
+            this.isPlacingSplitOrders = false;
+            await this.closePosition(`${reason} - Adaptive sell at ${currentPrice.toFixed(2)} (target was ${targetPrice.toFixed(2)})`);
+            return;
+          } else {
+            console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} is above target ${targetPrice.toFixed(2)}, will try lower price on next attempt`);
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        } catch (error) {
+          console.error(`[TradingManager] Error on adaptive attempt ${attempt + 1}:`, error);
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
       }
+
+      // If all adaptive attempts failed, sell at current market price anyway (must stop the loss)
+      console.warn('[TradingManager] All adaptive attempts failed, selling at current market price to stop loss');
+      this.isPlacingOrder = false;
+      this.isPlacingSplitOrders = false;
+      await this.closePosition(`${reason} - All attempts failed, selling at market price to stop loss`);
     } catch (error) {
-      logger.error('TradingManager', 'closePositionWithAdaptiveSelling', 'Error in adaptive selling', error);
+      console.error('[TradingManager] Error in adaptive selling:', error);
       this.isPlacingOrder = false;
       this.isPlacingSplitOrders = false;
       // Fall back to regular close position
@@ -1111,15 +929,13 @@ export class TradingManager {
           feeRateBps: feeRateBps,
         };
 
-        logger.debug('TradingManager', 'placeSingleSellOrder', `Placing split SELL order ${orderIndex + 1}/${totalOrders}`, {
+        console.log(`[TradingManager] Placing split SELL order ${orderIndex + 1}/${totalOrders}:`, {
           direction,
           currentPrice: currentPricePercent.toFixed(2),
           yesPricePercent: yesPricePercent.toFixed(2),
           noPricePercent: noPricePercent.toFixed(2),
           sellSizeUSD: sellSize.toFixed(2),
           shares: shares.toFixed(2),
-          orderIndex,
-          totalOrders,
         });
 
         const response = await this.browserClobClient.createAndPostMarketOrder(
@@ -1179,139 +995,6 @@ export class TradingManager {
   }
 
   /**
-   * Handle simulated sell order (for testing without API credentials)
-   */
-  private handleSimulatedSellOrder(reason: string): void {
-    const position = this.status.currentPosition!;
-    const exitPricePercent = position.entryPrice; // Use entry price for simulation
-    const priceDiff = exitPricePercent - position.entryPrice;
-    const profit = (priceDiff / position.entryPrice) * position.size;
-
-    const exitTrade: Trade = {
-      id: `exit-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      eventSlug: position.eventSlug,
-      tokenId: position.tokenId,
-      side: 'SELL',
-      size: position.size,
-      price: exitPricePercent,
-      timestamp: Date.now(),
-      status: 'filled',
-      transactionHash: `0x${Math.random().toString(16).substr(2, 64)}`,
-      profit,
-      reason: `Simulated exit: ${reason}`,
-      orderType: 'MARKET',
-      direction: position.direction,
-    };
-
-    this.trades.push(exitTrade);
-    this.status.totalTrades++;
-    this.status.totalProfit += profit;
-    this.status.successfulTrades++;
-    this.status.currentPosition = undefined;
-    this.notifyTradeUpdate(exitTrade);
-    this.notifyStatusUpdate();
-  }
-
-  /**
-   * Fetch prices for closing position
-   */
-  private async fetchSellPrices(): Promise<{ yesPricePercent: number; noPricePercent: number } | null> {
-    if (!this.activeEvent || !this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
-      logger.error('TradingManager', 'fetchSellPrices', 'Cannot close position: missing event or token IDs');
-      return null;
-    }
-
-    const yesTokenId = this.activeEvent.clobTokenIds[0];
-    const noTokenId = this.activeEvent.clobTokenIds[1];
-
-    const [yesPrice, noPrice] = await Promise.all([
-      this.clobClient.getPrice(yesTokenId, 'SELL'),
-      this.clobClient.getPrice(noTokenId, 'SELL'),
-    ]);
-
-    if (!yesPrice || !noPrice) {
-      logger.error('TradingManager', 'fetchSellPrices', 'Cannot close position: failed to fetch prices');
-      return null;
-    }
-
-    return {
-      yesPricePercent: toPercentage(yesPrice),
-      noPricePercent: toPercentage(noPrice),
-    };
-  }
-
-  /**
-   * Execute sell order splits and return exit trades with profit
-   */
-  private async executeSellOrderSplits(
-    position: { tokenId: string; eventSlug: string; entryPrice: number; direction?: 'UP' | 'DOWN' },
-    numSplits: number,
-    sizePerSplit: number,
-    direction: 'UP' | 'DOWN',
-    isLargePosition: boolean,
-    yesPricePercent: number,
-    noPricePercent: number,
-    reason: string
-  ): Promise<{ exitTrades: Trade[]; totalProfit: number; totalFilledSize: number }> {
-    let totalProfit = 0;
-    let totalFilledSize = 0;
-    const exitTrades: Trade[] = [];
-
-    for (let i = 0; i < numSplits; i++) {
-      const result = await this.placeSingleSellOrder(
-        position.tokenId,
-        sizePerSplit,
-        direction,
-        i,
-        numSplits,
-        yesPricePercent,
-        noPricePercent
-      );
-
-      if (result.success && result.orderId && result.fillPrice !== undefined) {
-        const priceDiff = result.fillPrice - position.entryPrice;
-        const splitProfit = (priceDiff / position.entryPrice) * sizePerSplit;
-        totalProfit += splitProfit;
-        totalFilledSize += sizePerSplit;
-
-        const exitTrade: Trade = {
-          id: `exit-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 9)}`,
-          eventSlug: position.eventSlug,
-          tokenId: position.tokenId,
-          side: 'SELL',
-          size: sizePerSplit,
-          price: result.fillPrice,
-          timestamp: Date.now(),
-          status: 'filled',
-          transactionHash: result.orderId,
-          profit: splitProfit,
-          reason: `Exit ${isLargePosition ? `(${i + 1}/${numSplits}) ` : ''}${reason}`,
-          orderType: 'MARKET',
-          direction,
-        };
-
-        exitTrades.push(exitTrade);
-        this.trades.push(exitTrade);
-        this.status.totalTrades++;
-        this.notifyTradeUpdate(exitTrade);
-      } else {
-        logger.error('TradingManager', 'executeSellOrderSplits', `Split sell order ${i + 1}/${numSplits} failed`, undefined, {
-          orderIndex: i + 1,
-          totalOrders: numSplits,
-          error: result.error,
-        });
-      }
-
-      // Small delay between split orders
-      if (i < numSplits - 1) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-      }
-    }
-
-    return { exitTrades, totalProfit, totalFilledSize };
-  }
-
-  /**
    * Close current position with market order
    * For large positions (>50 USD), splits sell orders into multiple trades
    * Uses API if credentials are available, otherwise simulates
@@ -1323,7 +1006,7 @@ export class TradingManager {
 
     // Prevent multiple simultaneous exit orders
     if (this.isPlacingOrder || this.isPlacingSplitOrders) {
-      logger.debug('TradingManager', 'closePosition', 'Exit order already being placed, skipping');
+      console.log('[TradingManager] Exit order already being placed, skipping...');
       return;
     }
 
@@ -1340,7 +1023,7 @@ export class TradingManager {
       const numSplits = isLargePosition ? 3 : 1; // Split into 3 for large positions
       const sizePerSplit = positionSize / numSplits;
 
-      logger.info('TradingManager', 'closePosition', 'Closing position (SELL)', {
+      console.log('[TradingManager] Closing position (SELL):', {
         tokenId: position.tokenId,
         size: positionSize,
         entryPrice: position.entryPrice,
@@ -1350,47 +1033,137 @@ export class TradingManager {
       });
 
       if (!this.apiCredentials) {
-        this.handleSimulatedSellOrder(reason);
+        // Simulation mode
+        const exitPricePercent = position.entryPrice; // Use entry price for simulation
+        const priceDiff = exitPricePercent - position.entryPrice;
+        const profit = (priceDiff / position.entryPrice) * positionSize;
+
+        const exitTrade: Trade = {
+          id: `exit-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          eventSlug: position.eventSlug,
+          tokenId: position.tokenId,
+          side: 'SELL',
+          size: positionSize,
+          price: exitPricePercent,
+          timestamp: Date.now(),
+          status: 'filled',
+          transactionHash: `0x${Math.random().toString(16).substr(2, 64)}`,
+          profit,
+          reason: `Simulated exit: ${reason}`,
+          orderType: 'MARKET',
+          direction,
+        };
+
+        this.trades.push(exitTrade);
+        this.status.totalTrades++;
+        this.status.totalProfit += profit;
+        this.status.successfulTrades++;
+        this.status.currentPosition = undefined;
+        this.notifyTradeUpdate(exitTrade);
+        this.notifyStatusUpdate();
         return;
       }
 
-      // Fetch prices for selling
-      const prices = await this.fetchSellPrices();
-      if (!prices) {
+      // Fetch current market prices (same as exit conditions) - use SELL side to get bid prices for selling
+      if (!this.activeEvent || !this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
+        console.error('[TradingManager] Cannot close position: missing event or token IDs');
         this.isPlacingOrder = false;
         this.isPlacingSplitOrders = false;
         return;
       }
 
-      logger.debug('TradingManager', 'closePosition', 'Closing position with prices', {
+      const yesTokenId = this.activeEvent.clobTokenIds[0]; // YES/UP token
+      const noTokenId = this.activeEvent.clobTokenIds[1]; // NO/DOWN token
+
+      // Get current market prices for both tokens (SELL side to get bid prices for selling)
+      // Note: Exit conditions are checked using BUY side prices (for condition checking),
+      // but order execution uses SELL side prices (for actual bid prices when selling)
+      // This is correct: we check conditions with one price source, execute with market-appropriate price
+      const [yesPrice, noPrice] = await Promise.all([
+        this.clobClient.getPrice(yesTokenId, 'SELL'),
+        this.clobClient.getPrice(noTokenId, 'SELL'),
+      ]);
+
+      if (!yesPrice || !noPrice) {
+        console.error('[TradingManager] Cannot close position: failed to fetch prices');
+        this.isPlacingOrder = false;
+        this.isPlacingSplitOrders = false;
+        return;
+      }
+
+      // Convert to percentage scale (0-100) - same variables as entry/exit conditions
+      const yesPricePercent = toPercentage(yesPrice);
+      const noPricePercent = toPercentage(noPrice);
+
+      console.log('[TradingManager] Closing position with prices:', {
         direction,
-        yesPricePercent: prices.yesPricePercent.toFixed(2),
-        noPricePercent: prices.noPricePercent.toFixed(2),
+        yesPricePercent: yesPricePercent.toFixed(2),
+        noPricePercent: noPricePercent.toFixed(2),
       });
 
-      // Execute sell orders
-      const { exitTrades, totalProfit, totalFilledSize } = await this.executeSellOrderSplits(
-        position,
-        numSplits,
-        sizePerSplit,
-        direction,
-        isLargePosition,
-        prices.yesPricePercent,
-        prices.noPricePercent,
-        reason
-      );
+      // Place real sell orders (single or split)
+      let totalProfit = 0;
+      let totalFilledSize = 0;
+      const exitTrades: Trade[] = [];
+
+      for (let i = 0; i < numSplits; i++) {
+        const result = await this.placeSingleSellOrder(
+          position.tokenId,
+          sizePerSplit,
+          direction,
+          i,
+          numSplits,
+          yesPricePercent,
+          noPricePercent
+        );
+
+        if (result.success && result.orderId && result.fillPrice !== undefined) {
+          const priceDiff = result.fillPrice - position.entryPrice;
+          const splitProfit = (priceDiff / position.entryPrice) * sizePerSplit;
+          totalProfit += splitProfit;
+          totalFilledSize += sizePerSplit;
+
+          const exitTrade: Trade = {
+            id: `exit-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 9)}`,
+            eventSlug: position.eventSlug,
+            tokenId: position.tokenId,
+            side: 'SELL',
+            size: sizePerSplit,
+            price: result.fillPrice,
+            timestamp: Date.now(),
+            status: 'filled',
+            transactionHash: result.orderId,
+            profit: splitProfit,
+            reason: `Exit ${isLargePosition ? `(${i + 1}/${numSplits}) ` : ''}${reason}`,
+            orderType: 'MARKET',
+            direction,
+          };
+
+          exitTrades.push(exitTrade);
+          this.trades.push(exitTrade);
+          this.status.totalTrades++;
+          this.notifyTradeUpdate(exitTrade);
+        } else {
+          console.error(`[TradingManager] ❌ Split sell order ${i + 1}/${numSplits} failed:`, result.error);
+        }
+
+        // Small delay between split orders
+        if (i < numSplits - 1) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
 
       if (totalFilledSize > 0) {
         this.status.successfulTrades++;
         this.status.totalProfit += totalProfit;
-        logger.info('TradingManager', 'closePosition', 'Position closed', {
+        console.log('[TradingManager] ✅ Position closed:', {
           direction,
           totalFilledSize: totalFilledSize.toFixed(2),
           totalProfit: totalProfit.toFixed(2),
           numOrders: exitTrades.length,
         });
       } else {
-        logger.error('TradingManager', 'closePosition', 'All sell orders failed');
+        console.error('[TradingManager] ❌ All sell orders failed');
         this.status.failedTrades++;
       }
 
@@ -1398,7 +1171,7 @@ export class TradingManager {
       this.status.currentPosition = undefined;
       this.notifyStatusUpdate();
     } catch (error) {
-      logger.error('TradingManager', 'closePosition', 'Error closing position', error);
+      console.error('[TradingManager] ❌ Error closing position:', error);
       this.status.failedTrades++;
     } finally {
       this.isPlacingOrder = false;
@@ -1412,27 +1185,53 @@ export class TradingManager {
     }
 
     if (!this.strategyConfig.enabled) {
-      logger.warn('TradingManager', 'startTrading', 'Strategy is not enabled');
+      console.warn('Strategy is not enabled');
       return;
     }
 
     this.status.isActive = true;
     this.notifyStatusUpdate();
 
-    // Start monitoring interval (check every 2 seconds for faster response)
-    this.monitoringInterval = window.setInterval(() => {
-      this.checkTradingConditions();
-    }, 2000);
+    // Start continuous monitoring loop
+    this.startContinuousMonitoring();
+  }
+
+  /**
+   * Start continuous monitoring loop (replaces interval-based monitoring)
+   * Checks trading conditions continuously with a small delay to prevent overwhelming the system
+   */
+  private async startContinuousMonitoring(): Promise<void> {
+    if (this.isMonitoring) {
+      return; // Already monitoring
+    }
+
+    this.isMonitoring = true;
+    console.log('[TradingManager] Starting continuous monitoring...');
+
+    // Continuous monitoring loop
+    while (this.isMonitoring && this.status.isActive) {
+      try {
+        // Check trading conditions
+        await this.checkTradingConditions();
+        
+        // Small delay to prevent overwhelming the system and API rate limits
+        // 100ms delay provides ~10 checks per second while being respectful to API
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (error) {
+        // Log error but continue monitoring (don't break the loop)
+        console.error('[TradingManager] Error in continuous monitoring loop:', error);
+        // Add a slightly longer delay on error to prevent rapid error loops
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+
+    console.log('[TradingManager] Continuous monitoring stopped');
   }
 
   stopTrading(): void {
     this.status.isActive = false;
+    this.isMonitoring = false; // Stop continuous monitoring loop
     
-    if (this.monitoringInterval !== null) {
-      clearInterval(this.monitoringInterval);
-      this.monitoringInterval = null;
-    }
-
     // Cancel all pending limit orders
     this.cancelAllPendingOrders();
 

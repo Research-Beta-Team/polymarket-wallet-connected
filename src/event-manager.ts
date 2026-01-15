@@ -121,11 +121,8 @@ export class EventManager {
       // Try tokens array
       if (!clobTokenIds && market.tokens && Array.isArray(market.tokens) && market.tokens.length > 0) {
         const tokenIds = market.tokens
-          .map((t) => {
-            const tokenId = t.token_id || t.tokenId || t.id || t.clobTokenId;
-            return tokenId;
-          })
-          .filter((id): id is string => Boolean(id));
+          .map((t: any) => t.token_id || t.tokenId || t.id || t.clobTokenId)
+          .filter(Boolean);
         if (tokenIds.length > 0) {
           clobTokenIds = tokenIds;
           console.log(`[EventManager] ✓ Found clobTokenIds in markets[0].tokens:`, clobTokenIds);

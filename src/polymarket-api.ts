@@ -1,9 +1,6 @@
 // Use proxy in both development and production to avoid CORS issues
 const GAMMA_API_BASE = '/api/polymarket';
 
-import type { PolymarketApiData } from './types/api-types';
-import { extractTokenId } from './types/api-types';
-
 export interface PolymarketEvent {
   slug: string;
   title: string;
@@ -101,33 +98,19 @@ export class PolymarketAPI {
       
       // Polymarket API returns nested structure, extract the fields we need
       // Try multiple possible locations for these fields
-      const extractConditionId = (d: PolymarketApiData): string | undefined => {
-        if (d.conditionId) return d.conditionId;
-        if (d.condition_id) return d.condition_id;
-        if (d.condition?.id) return d.condition.id;
-        if (d.markets && Array.isArray(d.markets) && d.markets.length > 0) {
-          const market = d.markets[0];
-          if (market.conditionId) return market.conditionId;
-          if (market.condition_id) return market.condition_id;
-        }
-        return undefined;
+      const extractConditionId = (d: any): string | undefined => {
+        return d.conditionId || d.condition_id || d.condition?.id || 
+               d.markets?.[0]?.conditionId || d.markets?.[0]?.condition_id ||
+               d.conditionId || d.conditions?.[0]?.id;
       };
       
-      const extractQuestionId = (d: PolymarketApiData): string | undefined => {
-        if (d.questionID) return d.questionID;
-        if (d.questionId) return d.questionId;
-        if (d.question_id) return d.question_id;
-        if (d.questionObj?.id) return d.questionObj.id;
-        if (d.markets && Array.isArray(d.markets) && d.markets.length > 0) {
-          const market = d.markets[0];
-          if (market.questionID) return market.questionID;
-          if (market.questionId) return market.questionId;
-          if (market.question_id) return market.question_id;
-        }
-        return undefined;
+      const extractQuestionId = (d: any): string | undefined => {
+        return d.questionID || d.questionId || d.question_id || d.question?.id || 
+               d.markets?.[0]?.questionID || d.markets?.[0]?.questionId || d.markets?.[0]?.question_id ||
+               d.questions?.[0]?.id;
       };
       
-      const extractClobTokenIds = (d: PolymarketApiData): string[] | undefined => {
+      const extractClobTokenIds = (d: any): string[] | undefined => {
         console.log('[extractClobTokenIds] Starting extraction. Data structure:', {
           hasMarkets: !!d.markets,
           marketsLength: d.markets?.length || 0,
@@ -226,7 +209,7 @@ export class PolymarketAPI {
           }
         }
         if (d.outcomes && Array.isArray(d.outcomes)) {
-          const tokenIds = d.outcomes.map((o) => extractTokenId(o)).filter((id): id is string => Boolean(id));
+          const tokenIds = d.outcomes.map((o: any) => o.token_id || o.tokenId || o.id).filter(Boolean);
           if (tokenIds.length > 0) {
             console.log('[extractClobTokenIds] ✓ Found in outcomes:', tokenIds);
             return tokenIds;
