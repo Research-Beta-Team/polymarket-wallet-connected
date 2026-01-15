@@ -31,6 +31,25 @@ export interface Trade {
   direction?: 'UP' | 'DOWN'; // Direction determined automatically (UP = YES token, DOWN = NO token)
 }
 
+export interface Position {
+  id: string; // Unique position ID
+  eventSlug: string;
+  tokenId: string;
+  side: 'BUY' | 'SELL';
+  entryPrice: number; // Entry price in 0-100 scale
+  size: number; // Position size in USD
+  currentPrice?: number; // Price in 0-100 scale
+  unrealizedProfit?: number;
+  direction?: 'UP' | 'DOWN'; // Direction (UP = YES token, DOWN = NO token)
+  filledOrders?: Array<{
+    orderId: string;
+    price: number; // Fill price in 0-100 scale
+    size: number; // Size in USD
+    timestamp: number;
+  }>; // Track individual filled orders for large positions
+  entryTimestamp: number; // When position was entered
+}
+
 export interface TradingStatus {
   isActive: boolean;
   totalTrades: number;
@@ -38,21 +57,26 @@ export interface TradingStatus {
   failedTrades: number;
   totalProfit: number;
   pendingLimitOrders: number;
+  positions: Position[]; // Array of positions (changed from single currentPosition)
+  totalPositionSize?: number; // Total size across all positions
+  walletBalance?: number; // Current wallet balance
+  maxPositionSize?: number; // 50% of wallet balance
+  // Keep currentPosition for backward compatibility during transition
   currentPosition?: {
     eventSlug: string;
     tokenId: string;
     side: 'BUY' | 'SELL';
-    entryPrice: number; // Average entry price in 0-100 scale (weighted by size)
-    size: number; // Total position size in USD
-    currentPrice?: number; // Price in 0-100 scale
+    entryPrice: number;
+    size: number;
+    currentPrice?: number;
     unrealizedProfit?: number;
-    direction?: 'UP' | 'DOWN'; // Direction (UP = YES token, DOWN = NO token)
+    direction?: 'UP' | 'DOWN';
     filledOrders?: Array<{
       orderId: string;
-      price: number; // Fill price in 0-100 scale
-      size: number; // Size in USD
+      price: number;
+      size: number;
       timestamp: number;
-    }>; // Track individual filled orders for large positions
+    }>;
   };
 }
 

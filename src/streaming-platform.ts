@@ -1248,6 +1248,10 @@ export class StreamingPlatform {
       }
 
       this.walletState.balance = data.balance;
+      // Update trading manager with wallet balance
+      if (data.balance !== null && data.balance !== undefined) {
+        this.tradingManager.setWalletBalance(data.balance);
+      }
       this.renderWalletSection();
     } catch (error) {
       console.error('Balance fetch error:', error);
@@ -1349,9 +1353,7 @@ export class StreamingPlatform {
               <tr>
                 <th>Order ID</th>
                 <th>Token ID</th>
-                <th>Side</th>
-                <th>Price</th>
-                <th>Size</th>
+                <th>Hash</th>
                 <th>Filled</th>
                 <th>Status</th>
                 <th>Created</th>
@@ -1359,7 +1361,7 @@ export class StreamingPlatform {
               </tr>
             </thead>
             <tbody>
-              <tr><td colspan="9" class="orders-empty-cell">Wallet not initialized. Please initialize trading session first.</td></tr>
+              <tr><td colspan="7" class="orders-empty-cell">Wallet not initialized. Please initialize trading session first.</td></tr>
             </tbody>
           </table>
         `;
@@ -1376,22 +1378,20 @@ export class StreamingPlatform {
     if (ordersContainer) {
       // Show loading state with table structure
       ordersContainer.innerHTML = `
-        <table class="orders-table">
-          <thead>
-            <tr>
-              <th>Order ID</th>
-              <th>Token ID</th>
-              <th>Side</th>
-              <th>Price</th>
-              <th>Size</th>
-              <th>Filled</th>
-              <th>Status</th>
-              <th>Created</th>
-              <th>Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td colspan="9" class="orders-loading-cell">Loading orders...</td></tr>
+          <table class="orders-table">
+            <thead>
+              <tr>
+                <th>Order ID</th>
+                <th>Token ID</th>
+                <th>Hash</th>
+                <th>Filled</th>
+                <th>Status</th>
+                <th>Created</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr><td colspan="7" class="orders-loading-cell">Loading orders...</td></tr>
           </tbody>
         </table>
       `;
@@ -1413,8 +1413,9 @@ export class StreamingPlatform {
       const orders = data.orders || [];
       console.log('[Orders] Fetched orders:', orders.length);
       
-      // Get current position from trading manager
-      const position = this.tradingManager.getStatus().currentPosition;
+      // Get all positions from trading manager
+      const status = this.tradingManager.getStatus();
+      const positions = status.positions || [];
       
       // Count orders by status
       const liveOrders = orders.filter((o: any) => o.status === 'LIVE').length;
@@ -1423,33 +1424,45 @@ export class StreamingPlatform {
       ).length;
 
       if (ordersCount) {
-        const positionText = position ? '1 position' : '';
+        const positionText = positions.length > 0 ? `${positions.length} position${positions.length > 1 ? 's' : ''}` : '';
         const ordersText = orders.length === 0 ? 'No orders' : `${orders.length} total (${liveOrders} live, ${filledOrders} filled)`;
-        ordersCount.textContent = position ? `${positionText}, ${ordersText}` : ordersText;
+        ordersCount.textContent = positions.length > 0 ? `${positionText}, ${ordersText}` : ordersText;
       }
 
       // Always render orders table with headers
       if (ordersContainer) {
-        // Build position row if position exists
-        const positionRow = position ? `
-          <tr class="order-row order-position" data-position="true">
-            <td class="order-id">POSITION</td>
-            <td class="token-id">${position.tokenId ? position.tokenId.substring(0, 10) + '...' : '--'}</td>
-            <td><span class="side-${(position.side || '').toLowerCase()}">${position.side || 'BUY'}</span></td>
-            <td>${position.entryPrice ? position.entryPrice.toFixed(4) : '--'}</td>
-            <td>${position.size ? position.size.toFixed(2) : '--'}</td>
-            <td>${position.size ? position.size.toFixed(2) : '--'} (100%)</td>
-            <td><span class="status-badge status-position">ACTIVE</span></td>
-            <td>${position.direction || '--'}</td>
-            <td>
-              <button class="btn-sell-order btn-sell-position" 
-                data-token-id="${position.tokenId || ''}" 
-                data-size="${position.size || 0}"
-                data-price="${position.entryPrice || 0}"
-                data-direction="${position.direction || ''}">Sell Position</button>
-            </td>
-          </tr>
-        ` : '';
+        // Build position rows for all positions
+        const positionRows = positions.map((position, index) => {
+          // Get filled orders for this position
+          const filledOrdersForPosition = position.filledOrders || [];
+          const totalFilled = filledOrdersForPosition.reduce((sum, fo) => sum + fo.size, 0);
+          const fillPercentage = position.size > 0 ? (totalFilled / position.size * 100).toFixed(1) : '0.0';
+          
+          // Get first order ID and hash from filled orders
+          const firstOrder = filledOrdersForPosition[0];
+          const orderId = firstOrder?.orderId ? firstOrder.orderId.substring(0, 8) + '...' : `POS-${index + 1}`;
+          const hash = firstOrder?.orderId ? firstOrder.orderId.substring(0, 16) + '...' : '--';
+          const created = firstOrder?.timestamp ? new Date(firstOrder.timestamp).toLocaleString() : new Date(position.entryTimestamp).toLocaleString();
+          
+          return `
+            <tr class="order-row order-position" data-position-id="${position.id}">
+              <td class="order-id">${orderId}</td>
+              <td class="token-id">${position.tokenId ? position.tokenId.substring(0, 10) + '...' : '--'}</td>
+              <td>${hash}</td>
+              <td>${totalFilled.toFixed(2)} (${fillPercentage}%)</td>
+              <td><span class="status-badge status-position">ACTIVE</span></td>
+              <td>${created}</td>
+              <td>
+                <button class="btn-sell-order btn-sell-position" 
+                  data-position-id="${position.id}"
+                  data-token-id="${position.tokenId || ''}" 
+                  data-size="${position.size || 0}"
+                  data-price="${position.entryPrice || 0}"
+                  data-direction="${position.direction || ''}">Sell</button>
+              </td>
+            </tr>
+          `;
+        }).join('');
 
         ordersContainer.innerHTML = `
           <table class="orders-table">
@@ -1457,9 +1470,7 @@ export class StreamingPlatform {
               <tr>
                 <th>Order ID</th>
                 <th>Token ID</th>
-                <th>Side</th>
-                <th>Price</th>
-                <th>Size</th>
+                <th>Hash</th>
                 <th>Filled</th>
                 <th>Status</th>
                 <th>Created</th>
@@ -1467,9 +1478,9 @@ export class StreamingPlatform {
               </tr>
             </thead>
             <tbody>
-              ${positionRow}
-              ${orders.length === 0 && !position
-                ? '<tr><td colspan="9" class="orders-empty-cell">No orders</td></tr>'
+              ${positionRows}
+              ${orders.length === 0 && positions.length === 0
+                ? '<tr><td colspan="7" class="orders-empty-cell">No orders or positions</td></tr>'
                 : orders.map((order: any) => {
                     const orderStatus = (order.status || 'UNKNOWN').toUpperCase();
                     const isFilled = orderStatus === 'FILLED' || orderStatus === 'EXECUTED' || orderStatus === 'CLOSED';
@@ -1483,9 +1494,7 @@ export class StreamingPlatform {
                       <tr class="${rowClass}" data-order-id="${order.id}">
                         <td class="order-id">${order.id ? order.id.substring(0, 8) + '...' : '--'}</td>
                         <td class="token-id">${order.asset_id ? order.asset_id.substring(0, 10) + '...' : order.token_id ? order.token_id.substring(0, 10) + '...' : '--'}</td>
-                        <td><span class="side-${(order.side || '').toLowerCase()}">${order.side || '--'}</span></td>
-                        <td>${parseFloat(order.price || 0).toFixed(4)}</td>
-                        <td>${parseFloat(order.original_size || order.size || 0).toFixed(2)}</td>
+                        <td>${(order.transaction_hash || order.hash || order.id || '--').substring(0, 16)}${(order.transaction_hash || order.hash || order.id || '').length > 16 ? '...' : ''}</td>
                         <td>${parseFloat(order.size_matched || order.filled_size || 0).toFixed(2)} (${fillPercentage}%)</td>
                         <td><span class="status-badge status-${orderStatus.toLowerCase()}">${order.status || 'UNKNOWN'}</span></td>
                         <td>${order.created_at ? new Date(order.created_at * 1000).toLocaleString() : order.created_at_iso || '--'}</td>
