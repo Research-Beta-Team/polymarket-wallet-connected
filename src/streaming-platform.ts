@@ -999,21 +999,28 @@ export class StreamingPlatform {
     const statusDisplay = document.getElementById('trading-status-display');
     if (statusDisplay) {
       const positions = status.positions || [];
+      const totalPositionSize = positions.reduce((sum, p) => sum + p.size, 0);
+      const totalUnrealizedProfit = positions.reduce((sum, p) => sum + (p.unrealizedProfit || 0), 0);
+      
       const positionInfo = positions.length > 0
         ? `
           <div class="position-info">
             <h4>Open Positions (${positions.length})</h4>
-            ${status.totalPositionSize !== undefined ? `<div style="margin-bottom: 10px;"><strong>Total Position Size:</strong> $${status.totalPositionSize.toFixed(2)}</div>` : ''}
-            ${status.maxPositionSize !== undefined ? `<div style="margin-bottom: 10px;"><strong>Max Position Size:</strong> $${status.maxPositionSize.toFixed(2)} (50% of balance)</div>` : ''}
+            <div style="margin-bottom: 15px; padding: 10px; background-color: #f5f5f5; border-radius: 4px;">
+              <div style="font-weight: bold; margin-bottom: 8px; font-size: 1.1em;">Cumulative Summary</div>
+              <div><strong>Total Position Size:</strong> $${totalPositionSize.toFixed(2)}</div>
+              ${status.maxPositionSize !== undefined ? `<div><strong>Max Position Size:</strong> $${status.maxPositionSize.toFixed(2)} (50% of balance)</div>` : ''}
+              ${totalUnrealizedProfit !== undefined ? `<div class="${totalUnrealizedProfit >= 0 ? 'profit' : 'loss'}" style="margin-top: 5px;"><strong>Total Unrealized P/L:</strong> $${totalUnrealizedProfit.toFixed(2)}</div>` : ''}
+            </div>
             ${positions.map((position, index) => `
               <div class="position-details" style="margin-bottom: 15px; padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
-                <div style="font-weight: bold; margin-bottom: 8px;">Position ${index + 1}</div>
+                <div style="font-weight: bold; margin-bottom: 8px;">Position ${index + 1} of ${positions.length}</div>
                 <div><strong>Event:</strong> ${position.eventSlug}</div>
                 <div><strong>Direction:</strong> ${position.direction || 'N/A'}</div>
                 <div><strong>Side:</strong> ${position.side}</div>
                 <div><strong>Entry Price:</strong> ${position.entryPrice.toFixed(2)}</div>
                 <div><strong>Size:</strong> $${position.size.toFixed(2)}</div>
-                ${position.currentPrice !== undefined ? `<div><strong>Current Price:</strong> ${position.currentPrice.toFixed(2)}</div>` : ''}
+                ${position.currentPrice !== undefined ? `<div><strong>Current Price:</strong> ${position.currentPrice.toFixed(2)}</div>` : '<div><strong>Current Price:</strong> <em>Updating...</em></div>'}
                 ${position.unrealizedProfit !== undefined ? `<div class="${position.unrealizedProfit >= 0 ? 'profit' : 'loss'}"><strong>Unrealized P/L:</strong> $${position.unrealizedProfit.toFixed(2)}</div>` : ''}
               </div>
             `).join('')}

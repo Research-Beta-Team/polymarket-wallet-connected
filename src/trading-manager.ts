@@ -176,10 +176,13 @@ export class TradingManager {
       return;
     }
 
-    // If we have positions, check exit conditions FIRST (regardless of price difference)
+    // If we have positions, update prices and check exit conditions FIRST (regardless of price difference)
     // Price difference check only applies to entry conditions, not exit conditions
     const activePositions = this.getActivePositions();
     if (activePositions.length > 0) {
+      // Update position prices continuously (even if not checking exit conditions)
+      await this.updatePositionPrices();
+      // Then check exit conditions
       await this.checkExitConditions();
       return;
     }
@@ -449,13 +452,23 @@ export class TradingManager {
         );
 
         if (response?.orderID) {
+          console.log(`[TradingManager] ✅ Order ${orderIndex + 1}/${totalOrders} placed successfully:`, {
+            orderId: response.orderID.substring(0, 8) + '...',
+            fillPrice: toPercentage(askPrice).toFixed(2),
+            orderSize: orderSize.toFixed(2),
+          });
           return {
             success: true,
             orderId: response.orderID,
             fillPrice: toPercentage(askPrice),
           };
         } else {
-          return { success: false, error: 'No order ID returned' };
+          const errorMsg = 'No order ID returned from exchange';
+          console.error(`[TradingManager] ❌ Order ${orderIndex + 1}/${totalOrders} failed:`, errorMsg, {
+            response: response,
+            tokenId: tokenId.substring(0, 10) + '...',
+          });
+          return { success: false, error: errorMsg };
         }
       } else {
         // Fallback to server-side API
@@ -482,13 +495,26 @@ export class TradingManager {
 
         const data = await response.json();
         if (response.ok && data.orderId) {
+          console.log(`[TradingManager] ✅ Order ${orderIndex + 1}/${totalOrders} placed via API:`, {
+            orderId: data.orderId.substring(0, 8) + '...',
+            fillPrice: toPercentage(askPrice).toFixed(2),
+            orderSize: orderSize.toFixed(2),
+          });
           return {
             success: true,
             orderId: data.orderId,
             fillPrice: toPercentage(askPrice),
           };
         } else {
-          return { success: false, error: data.error || 'Order failed' };
+          const errorMsg = data.error || 'Order failed';
+          console.error(`[TradingManager] ❌ Order ${orderIndex + 1}/${totalOrders} failed via API:`, {
+            error: errorMsg,
+            status: response.status,
+            statusText: response.statusText,
+            data: data,
+            tokenId: tokenId.substring(0, 10) + '...',
+          });
+          return { success: false, error: errorMsg };
         }
       }
     } catch (error) {
@@ -615,7 +641,13 @@ export class TradingManager {
           this.status.totalTrades++;
           this.notifyTradeUpdate(trade);
         } else {
-          console.error(`[TradingManager] ❌ Split order ${i + 1}/${orderSplits.length} failed:`, result.error);
+          console.error(`[TradingManager] ❌ Split order ${i + 1}/${orderSplits.length} failed:`, {
+            error: result.error,
+            tokenId: tokenId.substring(0, 10) + '...',
+            direction,
+            targetPrice: split.price.toFixed(2),
+            orderSize: split.size.toFixed(2),
+          });
           // Continue with other orders even if one fails
         }
 
@@ -625,11 +657,19 @@ export class TradingManager {
         }
       }
 
+      // Track failed orders for better error reporting
+      const failedOrderCount = orderSplits.length - filledOrders.length;
+      
       if (filledOrders.length > 0) {
         // Calculate weighted average entry price
         const avgEntryPrice = this.calculateWeightedAverageEntryPrice(
           filledOrders.map(o => ({ price: o.price, size: o.size }))
         );
+        
+        // Log partial success if some orders failed
+        if (failedOrderCount > 0) {
+          console.warn(`[TradingManager] ⚠️ Partial success: ${filledOrders.length} of ${orderSplits.length} orders filled. ${failedOrderCount} order(s) failed.`);
+        }
 
         // Create NEW position (don't overwrite existing)
         const newPosition: Position = {
@@ -677,13 +717,27 @@ export class TradingManager {
           }
         }, 2000); // 2 second delay to ensure orders are registered
       } else {
-        console.error('[TradingManager] ❌ All orders failed');
+        console.error(`[TradingManager] ❌ All ${orderSplits.length} order(s) failed for ${direction} position at entry price ${entryPrice.toFixed(2)}`);
+        console.error('[TradingManager] ❌ Possible reasons:');
+        console.error('  - Insufficient balance');
+        console.error('  - Invalid market price');
+        console.error('  - API rate limiting');
+        console.error('  - Network/Cloudflare issues');
+        console.error('  - Order rejection by exchange');
         this.status.failedTrades++;
       }
 
       this.notifyStatusUpdate();
     } catch (error) {
-      console.error('[TradingManager] ❌ Error placing market order:', error);
+      const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+      console.error('[TradingManager] ❌ Exception in placeMarketOrder:', {
+        error: errorMsg,
+        errorType: error instanceof Error ? error.constructor.name : typeof error,
+        tokenId: tokenId.substring(0, 10) + '...',
+        direction,
+        entryPrice: entryPrice.toFixed(2),
+        stack: error instanceof Error ? error.stack : undefined,
+      });
       this.status.failedTrades++;
     } finally {
       this.isPlacingOrder = false;
@@ -749,6 +803,61 @@ export class TradingManager {
       }
     } catch (error) {
       console.error('Error checking limit order fill:', error);
+    }
+  }
+
+  /**
+   * Update position prices continuously (called separately from exit condition checking)
+   */
+  private async updatePositionPrices(): Promise<void> {
+    const activePositions = this.getActivePositions();
+
+    if (activePositions.length === 0) {
+      return;
+    }
+
+    if (!this.activeEvent || !this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
+      return;
+    }
+
+    try {
+      const yesTokenId = this.activeEvent.clobTokenIds[0]; // YES/UP token
+      const noTokenId = this.activeEvent.clobTokenIds[1]; // NO/DOWN token
+
+      if (!yesTokenId || !noTokenId) {
+        return;
+      }
+
+      // Get current market prices for both tokens
+      const [yesPrice, noPrice] = await Promise.all([
+        this.clobClient.getPrice(yesTokenId, 'BUY'),
+        this.clobClient.getPrice(noTokenId, 'BUY'),
+      ]);
+
+      if (!yesPrice || !noPrice) {
+        return;
+      }
+
+      // Convert to percentage scale (0-100)
+      const yesPricePercent = toPercentage(yesPrice);
+      const noPricePercent = toPercentage(noPrice);
+
+      // Update all positions' current prices and unrealized P/L
+      for (const position of activePositions) {
+        const direction = position.direction || 'UP';
+        const currentPrice = direction === 'UP' ? yesPricePercent : noPricePercent;
+
+        // Update position current price and unrealized P/L
+        position.currentPrice = currentPrice;
+        const priceDiff = currentPrice - position.entryPrice;
+        position.unrealizedProfit = (priceDiff / position.entryPrice) * position.size;
+      }
+
+      // Update status and notify UI
+      this.status.positions = [...this.positions];
+      this.notifyStatusUpdate();
+    } catch (error) {
+      console.error('[TradingManager] Error updating position prices:', error);
     }
   }
 
@@ -823,11 +932,17 @@ export class TradingManager {
         position.unrealizedProfit = (priceDiff / position.entryPrice) * position.size;
       }
 
-      // Then, check exit conditions for ALL positions
+      // Then, check exit conditions for ALL positions using fresh prices
       // Exit ALL positions if ANY position meets profit target or stop loss
       for (const position of activePositions) {
         const direction = position.direction || 'UP';
+        // Use fresh price from API for exit condition checking
         const currentPrice = direction === 'UP' ? yesPricePercent : noPricePercent;
+        
+        // Also update position price with fresh data
+        position.currentPrice = currentPrice;
+        const priceDiff = currentPrice - position.entryPrice;
+        position.unrealizedProfit = (priceDiff / position.entryPrice) * position.size;
 
         // Check profit target condition
         if (currentPrice >= profitTarget) {
@@ -1018,8 +1133,10 @@ export class TradingManager {
 
   /**
    * Close all positions for the current event
+   * @param reason - Reason for closing positions
+   * @param isStopLoss - If true, uses aggressive mode: no splitting, no delays
    */
-  private async closeAllPositions(reason: string): Promise<void> {
+  private async closeAllPositions(reason: string, isStopLoss: boolean = false): Promise<void> {
     const activePositions = this.getActivePositions();
 
     if (activePositions.length === 0) {
@@ -1041,6 +1158,7 @@ export class TradingManager {
       console.log(`[TradingManager] 🚨 CLOSING ALL ${activePositions.length} POSITION(S) - ${reason}:`, {
         reason,
         totalSize: totalSize.toFixed(2),
+        isStopLoss,
         positions: activePositions.map((p, idx) => ({
           index: idx + 1,
           id: p.id.substring(0, 8) + '...',
@@ -1057,7 +1175,7 @@ export class TradingManager {
         const position = activePositions[i];
         try {
           console.log(`[TradingManager] [${i + 1}/${activePositions.length}] Closing position ${position.id.substring(0, 8)}... (${position.direction}, $${position.size.toFixed(2)})`);
-          await this.closeSinglePosition(position, reason);
+          await this.closeSinglePosition(position, reason, isStopLoss);
           closedPositionIds.push(position.id);
           console.log(`[TradingManager] ✅ [${i + 1}/${activePositions.length}] Successfully closed position ${position.id.substring(0, 8)}...`);
         } catch (error) {
@@ -1094,7 +1212,10 @@ export class TradingManager {
   }
 
   /**
-   * Close all positions with adaptive selling
+   * Aggressive stop loss exit - immediately sells ALL positions at market price
+   * No delays, no splitting, no adaptive selling - just immediate market orders
+   * For UP direction: when yesPricePercent <= stopLoss, aggressively sell all positions
+   * For DOWN direction: when noPricePercent <= stopLoss, aggressively sell all positions
    */
   private async closeAllPositionsWithAdaptiveSelling(
     reason: string,
@@ -1114,122 +1235,34 @@ export class TradingManager {
       return;
     }
 
-    this.isPlacingOrder = true;
-    this.isPlacingSplitOrders = true;
+    const currentPricePercent = isDownDirection ? noPricePercent : yesPricePercent;
+    
+    console.log('[TradingManager] 🛑🛑🛑 AGGRESSIVE STOP LOSS TRIGGERED - Immediately selling ALL positions:', {
+      stopLossPrice,
+      direction: isDownDirection ? 'DOWN' : 'UP',
+      currentPrice: currentPricePercent.toFixed(2),
+      numPositions: activePositions.length,
+      reason,
+    });
 
-    try {
-      const currentPricePercent = isDownDirection ? noPricePercent : yesPricePercent;
-      
-      console.log('[TradingManager] Stop loss triggered - attempting immediate sell for all positions:', {
-        stopLossPrice,
-        direction: isDownDirection ? 'DOWN' : 'UP',
-        currentPrice: currentPricePercent.toFixed(2),
-        numPositions: activePositions.length,
-        reason,
-      });
-
-      // Try immediate sell first - temporarily clear flags so closeAllPositions can set them
-      this.isPlacingOrder = false;
-      this.isPlacingSplitOrders = false;
-      await this.closeAllPositions(`${reason} - Immediate sell at ${currentPricePercent.toFixed(2)}`);
-      
-      // Check if all positions were closed
-      const remainingPositions = this.getActivePositions();
-      if (remainingPositions.length === 0) {
-        console.log('[TradingManager] ✅ All positions closed successfully on immediate sell');
-        return;
-      }
-      
-      console.log(`[TradingManager] ⚠️ ${remainingPositions.length} position(s) still open, attempting adaptive selling...`);
-      
-      // Adaptive selling as fallback - set flags again
-      this.isPlacingOrder = true;
-      this.isPlacingSplitOrders = true;
-      
-      const maxAttempts = 5;
-      console.log('[TradingManager] Using adaptive selling as fallback for all positions:', {
-        stopLossPrice,
-        maxAttempts,
-        isDownDirection,
-        currentPrice: currentPricePercent.toFixed(2),
-      });
-
-      // For both UP and DOWN: try progressively lower prices
-      for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        const targetPrice = stopLossPrice - attempt;
-        
-        if (targetPrice < 0 || targetPrice > 100) {
-          console.warn('[TradingManager] Target price out of range, using market price');
-          this.isPlacingOrder = false;
-          this.isPlacingSplitOrders = false;
-          await this.closeAllPositions(reason);
-          return;
-        }
-
-        try {
-          console.log(`[TradingManager] Adaptive attempt ${attempt + 1}/${maxAttempts}: Trying to sell all positions at price ${targetPrice.toFixed(2)}`);
-          
-          const currentPrice = isDownDirection ? noPricePercent : yesPricePercent;
-          const canSell = currentPrice <= targetPrice;
-            
-          if (canSell) {
-            console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} meets target ${targetPrice.toFixed(2)}, proceeding with sale of all positions`);
-            this.isPlacingOrder = false;
-            this.isPlacingSplitOrders = false;
-            await this.closeAllPositions(`${reason} - Adaptive sell at ${currentPrice.toFixed(2)} (target was ${targetPrice.toFixed(2)})`);
-            
-            // Check if all positions were closed
-            const remainingAfterAdaptive = this.getActivePositions();
-            if (remainingAfterAdaptive.length === 0) {
-              console.log('[TradingManager] ✅ All positions closed successfully via adaptive selling');
-              return;
-            }
-            console.log(`[TradingManager] ⚠️ ${remainingAfterAdaptive.length} position(s) still open after adaptive attempt ${attempt + 1}`);
-          } else {
-            console.log(`[TradingManager] Current price ${currentPrice.toFixed(2)} is above target ${targetPrice.toFixed(2)}, will try lower price on next attempt`);
-            await new Promise(resolve => setTimeout(resolve, 500));
-          }
-        } catch (error) {
-          console.error(`[TradingManager] Error on adaptive attempt ${attempt + 1}:`, error);
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
-      }
-
-      // If all adaptive attempts failed, sell at current market price anyway
-      const finalRemainingPositions = this.getActivePositions();
-      if (finalRemainingPositions.length > 0) {
-        console.warn(`[TradingManager] All adaptive attempts failed, selling ${finalRemainingPositions.length} remaining position(s) at current market price to stop loss`);
-        this.isPlacingOrder = false;
-        this.isPlacingSplitOrders = false;
-        await this.closeAllPositions(`${reason} - All attempts failed, selling at market price to stop loss`);
-        
-        // Final check
-        const stillRemaining = this.getActivePositions();
-        if (stillRemaining.length > 0) {
-          console.error(`[TradingManager] ❌ CRITICAL: ${stillRemaining.length} position(s) could not be closed after all attempts!`);
-        } else {
-          console.log('[TradingManager] ✅ All positions closed successfully on final attempt');
-        }
-      } else {
-        console.log('[TradingManager] ✅ All positions were closed during adaptive attempts');
-      }
-    } catch (error) {
-      console.error('[TradingManager] Error in adaptive selling for all positions:', error);
-      this.isPlacingOrder = false;
-      this.isPlacingSplitOrders = false;
-    }
+    // Aggressive mode: immediately sell all positions at market price
+    // No delays, no splitting, no adaptive selling - just immediate market orders
+    await this.closeAllPositions(`${reason} - Aggressive stop loss exit at ${currentPricePercent.toFixed(2)}`, true);
   }
 
   /**
    * Close a single position
+   * @param position - Position to close
+   * @param reason - Reason for closing
+   * @param isStopLoss - If true, uses aggressive mode: no splitting, no delays between orders
    */
-  private async closeSinglePosition(position: Position, reason: string): Promise<void> {
+  private async closeSinglePosition(position: Position, reason: string, isStopLoss: boolean = false): Promise<void> {
     const positionSize = position.size;
-    const isLargePosition = positionSize > 50;
     const direction = position.direction || 'UP';
 
-    // Calculate sell splits for large positions
-    const numSplits = isLargePosition ? 3 : 1;
+    // For stop loss: no splitting - sell entire position at once for maximum speed
+    // For normal exits: split large positions (>50) into 3 orders
+    const numSplits = isStopLoss ? 1 : (positionSize > 50 ? 3 : 1);
     const sizePerSplit = positionSize / numSplits;
 
     console.log('[TradingManager] Closing single position (SELL):', {
@@ -1237,8 +1270,8 @@ export class TradingManager {
       tokenId: position.tokenId,
       size: positionSize,
       entryPrice: position.entryPrice,
-      isLargePosition,
-      numSplits,
+      isStopLoss,
+      numSplits: isStopLoss ? 1 : numSplits,
       direction,
     });
 
@@ -1327,7 +1360,7 @@ export class TradingManager {
           status: 'filled',
           transactionHash: result.orderId,
           profit: splitProfit,
-          reason: `Exit ${isLargePosition ? `(${i + 1}/${numSplits}) ` : ''}${reason}`,
+          reason: `${isStopLoss ? '🛑 AGGRESSIVE STOP LOSS: ' : ''}Exit ${numSplits > 1 ? `(${i + 1}/${numSplits}) ` : ''}${reason}`,
           orderType: 'MARKET',
           direction,
         };
@@ -1340,7 +1373,9 @@ export class TradingManager {
         console.error(`[TradingManager] ❌ Split sell order ${i + 1}/${numSplits} failed:`, result.error);
       }
 
-      if (i < numSplits - 1) {
+      // For stop loss: NO delays between orders - maximum speed
+      // For normal exits: small delay between split orders
+      if (!isStopLoss && i < numSplits - 1) {
         await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
@@ -1348,7 +1383,7 @@ export class TradingManager {
     if (totalFilledSize > 0) {
       this.status.successfulTrades++;
       this.status.totalProfit += totalProfit;
-      console.log('[TradingManager] ✅ Single position closed:', {
+      console.log(`[TradingManager] ✅ Single position closed${isStopLoss ? ' (AGGRESSIVE STOP LOSS)' : ''}:`, {
         positionId: position.id,
         direction,
         totalFilledSize: totalFilledSize.toFixed(2),
