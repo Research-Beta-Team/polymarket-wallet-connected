@@ -19,5 +19,10 @@
     "@polymarket/clob-client": "^5.2.0",
     "ethers": "^5.7.2",
     "viem": "^2.39.2"
+  },
+  "overrides": {
+    "path-to-regexp": "^8.2.0",
+    "undici": "^7.3.0",
+    "diff": "^8.0.3"
   }
 }
