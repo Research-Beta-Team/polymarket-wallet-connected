@@ -110,10 +110,15 @@ export class StreamingPlatform {
 
     // Wallet controls
     const connectWalletBtn = document.getElementById('connect-wallet');
+    const disconnectWalletBtn = document.getElementById('disconnect-wallet');
     const initializeSessionBtn = document.getElementById('initialize-session');
 
     connectWalletBtn?.addEventListener('click', () => {
       this.connectWallet();
+    });
+
+    disconnectWalletBtn?.addEventListener('click', () => {
+      this.disconnectWallet();
     });
 
     initializeSessionBtn?.addEventListener('click', () => {
@@ -821,6 +826,7 @@ export class StreamingPlatform {
               <div id="wallet-status-display"></div>
               <div class="wallet-actions">
                 <button id="connect-wallet" class="btn btn-primary">Connect Wallet</button>
+                <button id="disconnect-wallet" class="btn btn-secondary" style="display: none;">Disconnect Wallet</button>
                 <button id="initialize-session" class="btn btn-primary" disabled>Initialize Trading Session</button>
               </div>
             </div>
@@ -1189,6 +1195,35 @@ export class StreamingPlatform {
     }
   }
 
+  private disconnectWallet(): void {
+    console.log('[Wallet] Disconnecting wallet...');
+    
+    // Stop trading if active
+    if (this.tradingManager.getStatus().isActive) {
+      this.tradingManager.stopTrading();
+      console.log('[Wallet] Stopped active trading');
+    }
+    
+    // Reset wallet state
+    this.walletState.isConnected = false;
+    this.walletState.isInitialized = false;
+    this.walletState.eoaAddress = '';
+    this.walletState.proxyAddress = '';
+    this.walletState.balance = 0;
+    this.walletState.apiCredentials = null;
+    this.walletState.error = null;
+    
+    // Clear trading manager credentials
+    this.tradingManager.setApiCredentials(null);
+    this.tradingManager.setBrowserClobClient(null);
+    
+    // Update UI
+    this.renderWalletSection();
+    this.renderTradingSection();
+    
+    console.log('[Wallet] ✅ Wallet disconnected successfully');
+  }
+
   private async initializeTradingSession(): Promise<void> {
     if (!this.walletState.isConnected) {
       alert('Please connect wallet first');
@@ -1283,6 +1318,7 @@ export class StreamingPlatform {
     const balanceEl = document.getElementById('wallet-balance');
     const balanceDisplay = document.getElementById('balance-display');
     const connectBtn = document.getElementById('connect-wallet') as HTMLButtonElement;
+    const disconnectBtn = document.getElementById('disconnect-wallet') as HTMLButtonElement;
     const initBtn = document.getElementById('initialize-session') as HTMLButtonElement;
 
     if (statusDisplay) {
@@ -1304,9 +1340,24 @@ export class StreamingPlatform {
       statusDisplay.innerHTML = statusHtml;
     }
 
+    // Show/hide connect and disconnect buttons based on connection state
     if (connectBtn) {
-      connectBtn.disabled = this.walletState.isLoading;
-      connectBtn.textContent = this.walletState.isLoading ? 'Connecting...' : 'Connect Wallet';
+      if (this.walletState.isConnected) {
+        connectBtn.style.display = 'none';
+      } else {
+        connectBtn.style.display = 'inline-block';
+        connectBtn.disabled = this.walletState.isLoading;
+        connectBtn.textContent = this.walletState.isLoading ? 'Connecting...' : 'Connect Wallet';
+      }
+    }
+
+    if (disconnectBtn) {
+      if (this.walletState.isConnected) {
+        disconnectBtn.style.display = 'inline-block';
+        disconnectBtn.disabled = this.walletState.isLoading;
+      } else {
+        disconnectBtn.style.display = 'none';
+      }
     }
 
     if (initBtn) {
