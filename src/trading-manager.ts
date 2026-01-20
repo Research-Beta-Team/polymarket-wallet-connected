@@ -30,6 +30,8 @@ export class TradingManager {
   private priceBelowEntry: boolean = false; // Track if price dropped below entry after position
   private consecutiveFailures: number = 0; // Circuit breaker counter
   private readonly MAX_CONSECUTIVE_FAILURES = 5; // Circuit breaker threshold
+  private orderPlacementStartTime: number = 0; // Track when order placement started
+  private readonly MAX_ORDER_PLACEMENT_TIME = 30000; // 30 seconds max for order placement
 
   constructor() {
     this.clobClient = new CLOBClientWrapper();
@@ -178,15 +180,18 @@ export class TradingManager {
    */
   private async checkTradingConditions(): Promise<void> {
     if (!this.strategyConfig.enabled || !this.status.isActive) {
+      console.log('[TradingManager] checkTradingConditions skipped: enabled=', this.strategyConfig.enabled, 'active=', this.status.isActive);
       return;
     }
 
     if (!this.activeEvent) {
+      console.log('[TradingManager] checkTradingConditions skipped: no active event');
       return;
     }
 
     // Check if we have token IDs for the active event
     if (!this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
+      console.log('[TradingManager] checkTradingConditions skipped: missing token IDs');
       return;
     }
 
@@ -201,6 +206,7 @@ export class TradingManager {
     // Price difference check only applies to entry conditions, not exit conditions
     const activePositions = this.getActivePositions();
     if (activePositions.length > 0) {
+      console.log(`[TradingManager] Monitoring ${activePositions.length} position(s), flags: placing=${this.isPlacingOrder}, split=${this.isPlacingSplitOrders}`);
       // Update position prices continuously (even if not checking exit conditions)
       await this.updatePositionPrices();
       // Then check exit conditions
@@ -355,6 +361,7 @@ export class TradingManager {
         // This prevents another call from entering while we're placing the order
         this.isPlacingOrder = true;
         this.isPlacingSplitOrders = true;
+        this.orderPlacementStartTime = Date.now(); // Track when order placement started
         
         try {
           await this.placeMarketOrder(tokenToTrade, entryPrice, direction);
@@ -791,6 +798,7 @@ export class TradingManager {
     } finally {
       this.isPlacingOrder = false;
       this.isPlacingSplitOrders = false;
+      this.orderPlacementStartTime = 0; // Reset timer
     }
   }
 
@@ -926,12 +934,23 @@ export class TradingManager {
     const activePositions = this.getActivePositions();
 
     if (activePositions.length === 0) {
+      console.log('[TradingManager] checkExitConditions: No active positions');
       return;
     }
 
     // Prevent multiple simultaneous exit orders
     if (this.isPlacingOrder || this.isPlacingSplitOrders) {
-      return;
+      // Check if flags are stuck (order taking too long)
+      const timeSinceOrderStart = Date.now() - this.orderPlacementStartTime;
+      if (timeSinceOrderStart > this.MAX_ORDER_PLACEMENT_TIME) {
+        console.error(`[TradingManager] 🚨 FLAGS STUCK! Order placement exceeded ${this.MAX_ORDER_PLACEMENT_TIME}ms. Force resetting flags.`);
+        this.isPlacingOrder = false;
+        this.isPlacingSplitOrders = false;
+        this.orderPlacementStartTime = 0;
+      } else {
+        console.log(`[TradingManager] ⚠️ checkExitConditions waiting - Order in progress (${timeSinceOrderStart}ms)`);
+        return;
+      }
     }
 
     if (!this.activeEvent || !this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
@@ -1214,6 +1233,7 @@ export class TradingManager {
 
     this.isPlacingOrder = true;
     this.isPlacingSplitOrders = true;
+    this.orderPlacementStartTime = Date.now(); // Track when order placement started
 
     const closedPositionIds: string[] = [];
 
@@ -1272,6 +1292,7 @@ export class TradingManager {
     } finally {
       this.isPlacingOrder = false;
       this.isPlacingSplitOrders = false;
+      this.orderPlacementStartTime = 0; // Reset timer
     }
   }
 
@@ -1490,11 +1511,21 @@ export class TradingManager {
     }
 
     this.isMonitoring = true;
-    console.log('[TradingManager] Starting continuous monitoring...');
+    console.log('[TradingManager] 🟢 Starting continuous monitoring...');
+    
+    let loopCount = 0;
+    const heartbeatInterval = 100; // Log heartbeat every 100 loops (10 seconds at 100ms per loop)
 
     // Continuous monitoring loop
     while (this.isMonitoring && this.status.isActive) {
       try {
+        loopCount++;
+        
+        // Heartbeat log every ~10 seconds to confirm loop is running
+        if (loopCount % heartbeatInterval === 0) {
+          console.log(`[TradingManager] 💓 Monitoring heartbeat (loop ${loopCount}): active=${this.status.isActive}, positions=${this.positions.length}`);
+        }
+        
         // Check trading conditions
         await this.checkTradingConditions();
         
@@ -1509,7 +1540,7 @@ export class TradingManager {
       }
     }
 
-    console.log('[TradingManager] Continuous monitoring stopped');
+    console.log('[TradingManager] 🔴 Continuous monitoring stopped');
   }
 
   stopTrading(): void {
