@@ -28,6 +28,8 @@ export class TradingManager {
   private isPlacingSplitOrders: boolean = false; // Flag to track if we're placing split orders
   private positions: Position[] = []; // Array of positions instead of single currentPosition
   private priceBelowEntry: boolean = false; // Track if price dropped below entry after position
+  private consecutiveFailures: number = 0; // Circuit breaker counter
+  private readonly MAX_CONSECUTIVE_FAILURES = 5; // Circuit breaker threshold
 
   constructor() {
     this.clobClient = new CLOBClientWrapper();
@@ -99,6 +101,25 @@ export class TradingManager {
       this.status.walletBalance = balance;
     }
     this.notifyStatusUpdate();
+  }
+
+  /**
+   * Verify sufficient balance before placing order
+   */
+  private verifyBalance(requiredAmount: number): boolean {
+    if (!this.status.walletBalance) {
+      console.warn('[TradingManager] Balance verification skipped - wallet balance not set');
+      return true; // Allow trade if balance is not set (simulation mode)
+    }
+    
+    const available = this.status.walletBalance;
+    if (available < requiredAmount) {
+      console.error(`[TradingManager] 🚫 Insufficient balance: Required ${requiredAmount.toFixed(2)} USDC, Available ${available.toFixed(2)} USDC`);
+      return false;
+    }
+    
+    console.log(`[TradingManager] ✅ Balance verified: Required ${requiredAmount.toFixed(2)} USDC, Available ${available.toFixed(2)} USDC`);
+    return true;
   }
 
   /**
@@ -238,6 +259,12 @@ export class TradingManager {
    */
   private async checkAndPlaceMarketOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
+      // Check circuit breaker first
+      if (this.consecutiveFailures >= this.MAX_CONSECUTIVE_FAILURES) {
+        console.error('[TradingManager] 🔴 Circuit breaker active - trading disabled. Restart trading to reset.');
+        return;
+      }
+      
       // Check if already placing an order (additional safeguard against race condition)
       if (this.isPlacingOrder || this.isPlacingSplitOrders) {
         console.log('[TradingManager] Order already being placed, skipping checkAndPlaceMarketOrder...');
@@ -277,39 +304,35 @@ export class TradingManager {
       const yesPricePercent = toPercentage(yesPrice);
       const noPricePercent = toPercentage(noPrice);
 
-      // Check if either token price equals entry price (exact match with small tolerance for floating point)
+      // Check if either token price is at or below entry price (better for fast markets)
       let tokenToTrade: string | null = null;
       let direction: 'UP' | 'DOWN' | null = null;
-      const tolerance = 0.01; // Small tolerance for floating point comparison
+      const tolerance = 0.5; // Allow entry within 0.5 of entry price for better execution
 
-      // Check UP token first (YES token)
-      if (Math.abs(yesPricePercent - entryPrice) <= tolerance) {
+      // Check UP token first (YES token) - enter when price <= entryPrice
+      if (yesPricePercent <= entryPrice + tolerance && yesPricePercent >= entryPrice - tolerance) {
         tokenToTrade = yesTokenId;
         direction = 'UP';
-        console.log(`[TradingManager] Entry condition met: yesTokenPrice ${yesPricePercent.toFixed(2)} == entryPrice ${entryPrice.toFixed(2)} → Filling UP position`);
+        console.log(`[TradingManager] Entry condition met: yesTokenPrice ${yesPricePercent.toFixed(2)} near entryPrice ${entryPrice.toFixed(2)} → Filling UP position`);
       }
       // Check DOWN token (NO token) - only if UP token hasn't matched
-      else if (Math.abs(noPricePercent - entryPrice) <= tolerance) {
+      else if (noPricePercent <= entryPrice + tolerance && noPricePercent >= entryPrice - tolerance) {
         tokenToTrade = noTokenId;
         direction = 'DOWN';
-        console.log(`[TradingManager] Entry condition met: noTokenPrice ${noPricePercent.toFixed(2)} == entryPrice ${entryPrice.toFixed(2)} → Filling DOWN position`);
+        console.log(`[TradingManager] Entry condition met: noTokenPrice ${noPricePercent.toFixed(2)} near entryPrice ${entryPrice.toFixed(2)} → Filling DOWN position`);
       } else {
-        // Price is not equal to entry - mark that we can re-enter if it comes back to entry price
+        // Price is not at entry - mark that we can re-enter if it comes back to entry price
         // Only set flag if price is BELOW entry (not just not equal)
         if (activePositions.length > 0) {
           const currentPrice = yesPricePercent >= noPricePercent ? yesPricePercent : noPricePercent;
-          if (currentPrice < entryPrice) {
+          if (currentPrice < entryPrice - tolerance) {
             this.priceBelowEntry = true;
           }
         }
-        // Log why entry condition wasn't met for debugging
-        console.log(`[TradingManager] Entry condition not met:`, {
-          yesPricePercent: yesPricePercent.toFixed(2),
-          noPricePercent: noPricePercent.toFixed(2),
-          entryPrice: entryPrice.toFixed(2),
-          yesMet: Math.abs(yesPricePercent - entryPrice) <= tolerance,
-          noMet: Math.abs(noPricePercent - entryPrice) <= tolerance,
-        });
+        // Log why entry condition wasn't met for debugging (less verbose)
+        if (yesPricePercent < entryPrice - 5 && noPricePercent < entryPrice - 5) {
+          console.log(`[TradingManager] Entry condition not met: prices too low (YES: ${yesPricePercent.toFixed(2)}, NO: ${noPricePercent.toFixed(2)}, Entry: ${entryPrice.toFixed(2)})`);
+        }
         return;
       }
 
@@ -336,19 +359,14 @@ export class TradingManager {
         try {
           await this.placeMarketOrder(tokenToTrade, entryPrice, direction);
         } catch (error) {
-          // Reset flags on error so we can retry
-          console.error('[TradingManager] Error in placeMarketOrder, resetting flags:', error);
-          this.isPlacingOrder = false;
-          this.isPlacingSplitOrders = false;
-          throw error;
+          // Don't reset flags here - let finally block handle it
+          console.error('[TradingManager] Error in placeMarketOrder:', error);
         }
-        // Note: placeMarketOrder will reset isPlacingOrder in its finally block
+        // Note: placeMarketOrder will reset flags in its finally block
       }
     } catch (error) {
       console.error('[TradingManager] Error checking for market order placement:', error);
-      // Ensure flags are reset on error
-      this.isPlacingOrder = false;
-      this.isPlacingSplitOrders = false;
+      // Don't reset flags here - they will be reset in placeMarketOrder's finally block
     }
   }
 
@@ -415,7 +433,10 @@ export class TradingManager {
         
         // For BUY orders, use BUY side to get ask price
         const askPriceResponse = await this.browserClobClient.getPrice(tokenId, Side.BUY);
-        const askPrice = parseFloat(askPriceResponse.price);
+        // Handle both object {price: "0.96"} and string "0.96" formats
+        const askPrice = typeof askPriceResponse === 'object' && askPriceResponse.price 
+          ? parseFloat(askPriceResponse.price) 
+          : parseFloat(askPriceResponse);
         
         if (isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
           return { success: false, error: 'Invalid market price' };
@@ -542,6 +563,14 @@ export class TradingManager {
 
     try {
       const tradeSize = this.strategyConfig.tradeSize;
+      
+      // Verify balance before placing order
+      if (!this.verifyBalance(tradeSize)) {
+        console.error('[TradingManager] ❌ Order rejected: Insufficient balance');
+        this.status.failedTrades++;
+        return;
+      }
+      
       const orderSplits = this.calculateOrderSplits(tradeSize, entryPrice);
       const isLargeOrder = tradeSize > 50;
 
@@ -600,6 +629,7 @@ export class TradingManager {
       // Place real orders (single or split)
       const filledOrders: Array<{ orderId: string; price: number; size: number; timestamp: number }> = [];
       let totalFilledSize = 0;
+      let orderFailed = false;
 
       for (let i = 0; i < orderSplits.length; i++) {
         const split = orderSplits[i];
@@ -640,6 +670,9 @@ export class TradingManager {
           this.trades.push(trade);
           this.status.totalTrades++;
           this.notifyTradeUpdate(trade);
+          
+          // Reset circuit breaker on success
+          this.consecutiveFailures = 0;
         } else {
           console.error(`[TradingManager] ❌ Split order ${i + 1}/${orderSplits.length} failed:`, {
             error: result.error,
@@ -648,13 +681,26 @@ export class TradingManager {
             targetPrice: split.price.toFixed(2),
             orderSize: split.size.toFixed(2),
           });
-          // Continue with other orders even if one fails
+          
+          // Increment circuit breaker counter
+          this.consecutiveFailures++;
+          orderFailed = true;
+          
+          // CRITICAL: If any order in split sequence fails, cancel remaining orders
+          console.error(`[TradingManager] 🚫 CANCELING REMAINING ${orderSplits.length - i - 1} ORDER(S) due to failure in order ${i + 1}`);
+          break; // Stop placing remaining orders
         }
 
         // Small delay between split orders to avoid rate limiting
         if (i < orderSplits.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 500));
         }
+      }
+      
+      // Check circuit breaker
+      if (this.consecutiveFailures >= this.MAX_CONSECUTIVE_FAILURES) {
+        console.error(`[TradingManager] 🔴 CIRCUIT BREAKER TRIGGERED: ${this.consecutiveFailures} consecutive failures. Stopping trading.`);
+        this.stopTrading();
       }
 
       // Track failed orders for better error reporting
@@ -666,8 +712,11 @@ export class TradingManager {
           filledOrders.map(o => ({ price: o.price, size: o.size }))
         );
         
-        // Log partial success if some orders failed
-        if (failedOrderCount > 0) {
+        // Log partial or full success
+        if (orderFailed) {
+          console.warn(`[TradingManager] ⚠️ PARTIAL FILL: ${filledOrders.length} of ${orderSplits.length} orders filled. ${failedOrderCount} order(s) canceled due to failure.`);
+          console.warn(`[TradingManager] ⚠️ Position created with partial size: ${totalFilledSize.toFixed(2)} USDC instead of planned ${tradeSize.toFixed(2)} USDC`);
+        } else if (failedOrderCount > 0) {
           console.warn(`[TradingManager] ⚠️ Partial success: ${filledOrders.length} of ${orderSplits.length} orders filled. ${failedOrderCount} order(s) failed.`);
         }
 
@@ -829,9 +878,10 @@ export class TradingManager {
       }
 
       // Get current market prices for both tokens
+      // Use SELL side for position valuation (what you'd get if selling now)
       const [yesPrice, noPrice] = await Promise.all([
-        this.clobClient.getPrice(yesTokenId, 'BUY'),
-        this.clobClient.getPrice(noTokenId, 'BUY'),
+        this.clobClient.getPrice(yesTokenId, 'SELL'),
+        this.clobClient.getPrice(noTokenId, 'SELL'),
       ]);
 
       if (!yesPrice || !noPrice) {
@@ -847,7 +897,7 @@ export class TradingManager {
         const direction = position.direction || 'UP';
         const currentPrice = direction === 'UP' ? yesPricePercent : noPricePercent;
 
-        // Update position current price and unrealized P/L
+        // Update position current price and unrealized P/L (based on SELL price - what you'd get)
         position.currentPrice = currentPrice;
         const priceDiff = currentPrice - position.entryPrice;
         position.unrealizedProfit = (priceDiff / position.entryPrice) * position.size;
@@ -896,17 +946,18 @@ export class TradingManager {
         return;
       }
 
-      // Get current market prices for both tokens (same as entry condition)
+      // Get current market prices for both tokens
+      // CRITICAL: Use SELL side for exit conditions (we're selling, so need BID prices)
       const [yesPrice, noPrice] = await Promise.all([
-        this.clobClient.getPrice(yesTokenId, 'BUY'),
-        this.clobClient.getPrice(noTokenId, 'BUY'),
+        this.clobClient.getPrice(yesTokenId, 'SELL'),
+        this.clobClient.getPrice(noTokenId, 'SELL'),
       ]);
 
       if (!yesPrice || !noPrice) {
         return;
       }
 
-      // Convert to percentage scale (0-100) - same variables as entry condition
+      // Convert to percentage scale (0-100)
       const yesPricePercent = toPercentage(yesPrice);
       const noPricePercent = toPercentage(noPrice);
 
@@ -965,38 +1016,51 @@ export class TradingManager {
         }
       }
 
-      // Log exit condition check
+      // Log exit condition check with detailed price comparison
       if (!shouldExit) {
-        // Only log detailed info if no exit condition was met (to reduce log noise)
-        console.log(`[TradingManager] Checking exit conditions for ${activePositions.length} position(s):`, {
-          yesPricePercent: yesPricePercent.toFixed(2),
-          noPricePercent: noPricePercent.toFixed(2),
+        // Log detailed info for debugging exit conditions
+        const exitCheckLog = {
+          yesSellPrice: yesPricePercent.toFixed(2),
+          noSellPrice: noPricePercent.toFixed(2),
           profitTarget: profitTarget.toFixed(2),
           stopLoss: stopLoss.toFixed(2),
-          positions: activePositions.map(p => ({
-            id: p.id.substring(0, 8),
-            direction: p.direction,
-            entryPrice: p.entryPrice.toFixed(2),
-            currentPrice: p.currentPrice?.toFixed(2),
-            unrealizedProfit: p.unrealizedProfit?.toFixed(2),
-          })),
-        });
+          positions: activePositions.map(p => {
+            const currentPrice = p.currentPrice || 0;
+            return {
+              id: p.id.substring(0, 8),
+              direction: p.direction,
+              entryPrice: p.entryPrice.toFixed(2),
+              currentSellPrice: currentPrice.toFixed(2),
+              profitCheck: `${currentPrice.toFixed(2)} >= ${profitTarget.toFixed(2)} = ${currentPrice >= profitTarget}`,
+              stopLossCheck: `${currentPrice.toFixed(2)} <= ${stopLoss.toFixed(2)} = ${currentPrice <= stopLoss}`,
+              unrealizedProfit: p.unrealizedProfit?.toFixed(2),
+            };
+          }),
+        };
+        console.log(`[TradingManager] Exit check: NO EXIT`, exitCheckLog);
       }
 
       if (shouldExit) {
-        console.log(`[TradingManager] 🚨 EXIT CONDITION MET - Closing ALL ${activePositions.length} position(s):`, {
+        console.log(`[TradingManager] 🚨🚨🚨 EXIT CONDITION MET - Closing ALL ${activePositions.length} position(s):`, {
           exitReason,
+          yesSellPrice: yesPricePercent.toFixed(2),
+          noSellPrice: noPricePercent.toFixed(2),
+          profitTarget: profitTarget.toFixed(2),
+          stopLoss: stopLoss.toFixed(2),
           triggeringPosition: triggeringPosition ? {
             id: triggeringPosition.id.substring(0, 8),
             direction: triggeringPosition.direction,
             entryPrice: triggeringPosition.entryPrice.toFixed(2),
-            currentPrice: triggeringPosition.currentPrice?.toFixed(2),
+            currentSellPrice: triggeringPosition.currentPrice?.toFixed(2),
+            profitCheck: `${triggeringPosition.currentPrice?.toFixed(2)} >= ${profitTarget.toFixed(2)} = ${(triggeringPosition.currentPrice || 0) >= profitTarget}`,
+            stopLossCheck: `${triggeringPosition.currentPrice?.toFixed(2)} <= ${stopLoss.toFixed(2)} = ${(triggeringPosition.currentPrice || 0) <= stopLoss}`,
           } : null,
           allPositions: activePositions.map(p => ({
             id: p.id.substring(0, 8),
             direction: p.direction,
             size: p.size.toFixed(2),
             entryPrice: p.entryPrice.toFixed(2),
+            currentSellPrice: p.currentPrice?.toFixed(2),
           })),
           useAdaptiveSelling,
         });
@@ -1409,6 +1473,7 @@ export class TradingManager {
     }
 
     this.status.isActive = true;
+    this.consecutiveFailures = 0; // Reset circuit breaker on start
     this.notifyStatusUpdate();
 
     // Start continuous monitoring loop
@@ -1450,6 +1515,7 @@ export class TradingManager {
   stopTrading(): void {
     this.status.isActive = false;
     this.isMonitoring = false; // Stop continuous monitoring loop
+    this.consecutiveFailures = 0; // Reset circuit breaker
     
     // Cancel all pending limit orders
     this.cancelAllPendingOrders();
