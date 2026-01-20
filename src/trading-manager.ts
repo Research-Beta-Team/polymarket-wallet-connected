@@ -206,7 +206,16 @@ export class TradingManager {
     // Price difference check only applies to entry conditions, not exit conditions
     const activePositions = this.getActivePositions();
     if (activePositions.length > 0) {
-      console.log(`[TradingManager] Monitoring ${activePositions.length} position(s), flags: placing=${this.isPlacingOrder}, split=${this.isPlacingSplitOrders}`);
+      // Check if exit is already in progress
+      if (this.isPlacingOrder || this.isPlacingSplitOrders) {
+        // Don't spam logs, but check if stuck
+        const timeSinceOrderStart = Date.now() - this.orderPlacementStartTime;
+        if (timeSinceOrderStart > 60000) { // 60 seconds
+          console.error(`[TradingManager] 🚨 EXIT IN PROGRESS FOR ${(timeSinceOrderStart / 1000).toFixed(0)}s - May be stuck!`);
+        }
+        return; // Skip this check cycle, exit already in progress
+      }
+      
       // Update position prices continuously (even if not checking exit conditions)
       await this.updatePositionPrices();
       // Then check exit conditions
@@ -1236,12 +1245,44 @@ export class TradingManager {
   }
 
   /**
+   * Aggregate positions by token to calculate total shares
+   */
+  private aggregatePositionsByToken(positions: Position[]): Map<string, { positions: Position[], totalSize: number, direction: 'UP' | 'DOWN' }> {
+    const aggregated = new Map<string, { positions: Position[], totalSize: number, direction: 'UP' | 'DOWN' }>();
+    
+    for (const position of positions) {
+      const tokenId = position.tokenId;
+      if (!aggregated.has(tokenId)) {
+        aggregated.set(tokenId, {
+          positions: [],
+          totalSize: 0,
+          direction: position.direction || 'UP'
+        });
+      }
+      
+      const agg = aggregated.get(tokenId)!;
+      agg.positions.push(position);
+      agg.totalSize += position.size;
+    }
+    
+    return aggregated;
+  }
+
+  /**
    * Close all positions for the current event
+   * 
+   * IMPROVED BEHAVIOR:
+   * - Aggregates positions by token (combines multiple positions for same token)
+   * - Sells cumulative shares in ONE order per token
+   * - Example: 2 positions of $2 at 65¢ = ONE order for $4 worth of shares (6.15 shares at current price)
+   * - More efficient, avoids rate limits, and ensures atomic execution
+   * 
    * @param reason - Reason for closing positions
    * @param isStopLoss - If true, uses aggressive mode: no splitting, no delays
    */
   private async closeAllPositions(reason: string, isStopLoss: boolean = false): Promise<void> {
-    const activePositions = this.getActivePositions();
+    // CRITICAL: Take a snapshot of positions to ensure they don't change during processing
+    const activePositions = [...this.getActivePositions()]; // Spread to create new array
 
     if (activePositions.length === 0) {
       console.log('[TradingManager] closeAllPositions: No active positions to close');
@@ -1258,6 +1299,22 @@ export class TradingManager {
     this.orderPlacementStartTime = Date.now(); // Track when order placement started
 
     const closedPositionIds: string[] = [];
+    const failedPositionIds: string[] = [];
+    
+    console.log(`[TradingManager] 🔒 Flags locked. isPlacingOrder=${this.isPlacingOrder}, isPlacingSplitOrders=${this.isPlacingSplitOrders}`);
+    console.log(`[TradingManager] 📸 Snapshot taken: ${activePositions.length} position(s) to close`);
+    
+    // Aggregate positions by token
+    const aggregatedByToken = this.aggregatePositionsByToken(activePositions);
+    console.log(`[TradingManager] 📊 Aggregated into ${aggregatedByToken.size} unique token(s):`, 
+      Array.from(aggregatedByToken.entries()).map(([tokenId, data]) => ({
+        tokenId: tokenId.substring(0, 10) + '...',
+        numPositions: data.positions.length,
+        totalSizeUSD: data.totalSize.toFixed(2),
+        direction: data.direction,
+        positionIds: data.positions.map(p => p.id.substring(0, 8) + '...')
+      }))
+    );
 
     try {
       const totalSize = activePositions.reduce((sum, p) => sum + p.size, 0);
@@ -1289,53 +1346,64 @@ export class TradingManager {
         })),
       });
 
-      // Close each position and track which ones were successfully closed
-      console.log(`[TradingManager] 🔄 Starting loop to close ${activePositions.length} position(s)...`);
+      // Close positions aggregated by token (cumulative shares per token)
+      console.log(`[TradingManager] 🔄 Processing ${aggregatedByToken.size} unique token(s)...`);
       
-      for (let i = 0; i < activePositions.length; i++) {
-        const position = activePositions[i];
-        console.log(`[TradingManager] 🔄 [${i + 1}/${activePositions.length}] LOOP ITERATION ${i + 1} - Starting...`);
+      let tokenCount = 0;
+      for (const [tokenId, aggregatedData] of aggregatedByToken.entries()) {
+        tokenCount++;
+        console.log(`[TradingManager] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        console.log(`[TradingManager] 🔄 [${tokenCount}/${aggregatedByToken.size}] PROCESSING TOKEN ${tokenCount}`);
+        console.log(`[TradingManager] 🔄 Token Details:`, {
+          tokenId: tokenId.substring(0, 10) + '...',
+          numPositions: aggregatedData.positions.length,
+          totalSizeUSD: aggregatedData.totalSize.toFixed(2),
+          direction: aggregatedData.direction,
+          positionIds: aggregatedData.positions.map(p => p.id.substring(0, 8) + '...')
+        });
         
         try {
-          console.log(`[TradingManager] 🔄 [${i + 1}/${activePositions.length}] ATTEMPTING to close position:`, {
-            positionId: position.id.substring(0, 8) + '...',
-            tokenId: position.tokenId.substring(0, 10) + '...',
-            direction: position.direction,
-            size: position.size.toFixed(2),
-            entryPrice: position.entryPrice.toFixed(2),
-            currentPrice: position.currentPrice?.toFixed(2),
-          });
+          // Close all positions for this token in ONE order
+          await this.closeAggregatedPositions(aggregatedData.positions, tokenId, aggregatedData.totalSize, aggregatedData.direction, reason, isStopLoss);
           
-          await this.closeSinglePosition(position, reason, isStopLoss);
-          closedPositionIds.push(position.id);
+          // Mark all positions for this token as closed
+          for (const pos of aggregatedData.positions) {
+            closedPositionIds.push(pos.id);
+          }
           
-          console.log(`[TradingManager] ✅✅✅ [${i + 1}/${activePositions.length}] SUCCESSFULLY CLOSED position ${position.id.substring(0, 8)}...`);
+          console.log(`[TradingManager] ✅✅✅ [${tokenCount}/${aggregatedByToken.size}] SUCCESS - Closed ${aggregatedData.positions.length} position(s) for token ${tokenId.substring(0, 10)}...`);
         } catch (error) {
           const errorMsg = error instanceof Error ? error.message : 'Unknown error';
           const errorStack = error instanceof Error ? error.stack : undefined;
-          console.error(`[TradingManager] ❌❌❌ [${i + 1}/${activePositions.length}] FAILED to close position ${position.id.substring(0, 8)}...:`, {
+          
+          // Mark all positions for this token as failed
+          for (const pos of aggregatedData.positions) {
+            failedPositionIds.push(pos.id);
+          }
+          
+          console.error(`[TradingManager] ❌❌❌ [${tokenCount}/${aggregatedByToken.size}] FAILED - Could not close ${aggregatedData.positions.length} position(s) for token ${tokenId.substring(0, 10)}...`);
+          console.error(`[TradingManager] ❌ Error details:`, {
             error: errorMsg,
             stack: errorStack,
-            positionId: position.id,
-            tokenId: position.tokenId.substring(0, 10) + '...',
-            direction: position.direction,
-            size: position.size.toFixed(2),
+            tokenId: tokenId.substring(0, 10) + '...',
+            totalSize: aggregatedData.totalSize.toFixed(2),
           });
-          // CRITICAL: Continue with next position even if one fails
-          console.log(`[TradingManager] ⚠️ Continuing to close remaining ${activePositions.length - i - 1} position(s)...`);
         }
         
-        console.log(`[TradingManager] 🔄 [${i + 1}/${activePositions.length}] LOOP ITERATION ${i + 1} - Completed`);
+        console.log(`[TradingManager] 🏁 [${tokenCount}/${aggregatedByToken.size}] FINISHED processing token ${tokenCount}`);
       }
       
-      console.log(`[TradingManager] 🏁 Loop completed. Processed all ${activePositions.length} iteration(s).`);
+      console.log(`[TradingManager] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`[TradingManager] 🏁 ALL ${aggregatedByToken.size} TOKEN(S) PROCESSED`);
+      console.log(`[TradingManager] 🏁 Total positions affected: ${activePositions.length}`);
 
       // Log completion of all attempts
       console.log(`[TradingManager] 🏁 FINISHED processing all ${activePositions.length} position(s). Results:`, {
         attempted: activePositions.length,
         succeeded: closedPositionIds.length,
-        failed: activePositions.length - closedPositionIds.length,
+        failed: failedPositionIds.length,
         closedPositionIds: closedPositionIds.map(id => id.substring(0, 8) + '...'),
+        failedPositionIds: failedPositionIds.map(id => id.substring(0, 8) + '...'),
       });
       
       // Remove only successfully closed positions
@@ -1351,14 +1419,14 @@ export class TradingManager {
         
         console.log(`[TradingManager] 📊 Position cleanup: ${positionsBeforeRemoval} → ${positionsAfterRemoval} (removed ${positionsBeforeRemoval - positionsAfterRemoval})`);
         
-        if (closedPositionIds.length === activePositions.length) {
+        if (failedPositionIds.length === 0) {
           console.log(`[TradingManager] ✅✅✅ FULL SUCCESS: All ${closedPositionIds.length} position(s) closed successfully!`);
         } else {
           console.warn(`[TradingManager] ⚠️⚠️⚠️ PARTIAL SUCCESS: Closed ${closedPositionIds.length} of ${activePositions.length} position(s)`);
-          console.warn(`[TradingManager] ⚠️ ${activePositions.length - closedPositionIds.length} position(s) FAILED to close and will remain open`);
+          console.warn(`[TradingManager] ⚠️ ${failedPositionIds.length} position(s) FAILED to close`);
           
-          // Log which positions failed
-          const failedPositions = activePositions.filter(p => !closedPositionIds.includes(p.id));
+          // Get full position details for failed positions
+          const failedPositions = activePositions.filter(p => failedPositionIds.includes(p.id));
           console.error(`[TradingManager] ❌ Failed positions:`, failedPositions.map(p => ({
             id: p.id.substring(0, 8) + '...',
             tokenId: p.tokenId.substring(0, 10) + '...',
@@ -1368,17 +1436,34 @@ export class TradingManager {
           
           // CRITICAL: If stop loss and not all positions closed, retry failed ones immediately
           if (isStopLoss && failedPositions.length > 0) {
-            console.error(`[TradingManager] 🔄 STOP LOSS RETRY: Attempting to close ${failedPositions.length} failed position(s) again...`);
+            console.error(`[TradingManager] 🔄🔄🔄 STOP LOSS RETRY: Attempting to close ${failedPositions.length} failed position(s) again...`);
+            console.error(`[TradingManager] 🔄 Waiting 1 second before retry...`);
+            await new Promise(resolve => setTimeout(resolve, 1000));
             
-            // Retry each failed position
-            for (const failedPos of failedPositions) {
+            // Re-aggregate failed positions by token for retry
+            const retryAggregated = this.aggregatePositionsByToken(failedPositions);
+            console.log(`[TradingManager] 🔄 Retry will process ${retryAggregated.size} token(s) covering ${failedPositions.length} position(s)`);
+            
+            // Retry each token
+            let retryTokenCount = 0;
+            for (const [retryTokenId, retryData] of retryAggregated.entries()) {
+              retryTokenCount++;
               try {
-                console.log(`[TradingManager] 🔄 RETRY: Attempting to close position ${failedPos.id.substring(0, 8)}...`);
-                await this.closeSinglePosition(failedPos, `${reason} - RETRY AFTER FAILURE`, true);
-                closedPositionIds.push(failedPos.id);
-                console.log(`[TradingManager] ✅ RETRY SUCCESS: Position ${failedPos.id.substring(0, 8)}... closed`);
+                console.log(`[TradingManager] 🔄 RETRY ${retryTokenCount}/${retryAggregated.size}: Token ${retryTokenId.substring(0, 10)}... (${retryData.positions.length} positions, $${retryData.totalSize.toFixed(2)})`);
+                await this.closeAggregatedPositions(retryData.positions, retryTokenId, retryData.totalSize, retryData.direction, `${reason} - RETRY AFTER FAILURE`, true);
+                
+                // Mark all positions for this token as closed
+                for (const pos of retryData.positions) {
+                  closedPositionIds.push(pos.id);
+                  // Remove from failed list
+                  const idx = failedPositionIds.indexOf(pos.id);
+                  if (idx > -1) failedPositionIds.splice(idx, 1);
+                }
+                
+                console.log(`[TradingManager] ✅ RETRY ${retryTokenCount} SUCCESS: ${retryData.positions.length} position(s) closed`);
               } catch (retryError) {
-                console.error(`[TradingManager] ❌ RETRY FAILED: Position ${failedPos.id.substring(0, 8)}... still could not be closed:`, retryError);
+                const retryErrorMsg = retryError instanceof Error ? retryError.message : 'Unknown error';
+                console.error(`[TradingManager] ❌ RETRY ${retryTokenCount} FAILED: Token ${retryTokenId.substring(0, 10)}... still could not be closed:`, retryErrorMsg);
               }
             }
             
@@ -1410,12 +1495,18 @@ export class TradingManager {
           // Wait a bit before retry
           await new Promise(resolve => setTimeout(resolve, 2000));
           
-          for (const position of activePositions) {
+          // Re-aggregate all positions for emergency retry
+          const emergencyAggregated = this.aggregatePositionsByToken(activePositions);
+          console.log(`[TradingManager] 🔄 Emergency retry will process ${emergencyAggregated.size} token(s)`);
+          
+          for (const [emergencyTokenId, emergencyData] of emergencyAggregated.entries()) {
             try {
-              await this.closeSinglePosition(position, `${reason} - EMERGENCY RETRY`, true);
-              closedPositionIds.push(position.id);
+              await this.closeAggregatedPositions(emergencyData.positions, emergencyTokenId, emergencyData.totalSize, emergencyData.direction, `${reason} - EMERGENCY RETRY`, true);
+              for (const pos of emergencyData.positions) {
+                closedPositionIds.push(pos.id);
+              }
             } catch (error) {
-              console.error(`[TradingManager] ❌ EMERGENCY RETRY FAILED for position ${position.id.substring(0, 8)}...`);
+              console.error(`[TradingManager] ❌ EMERGENCY RETRY FAILED for token ${emergencyTokenId.substring(0, 10)}...`);
             }
           }
           
@@ -1460,8 +1551,147 @@ export class TradingManager {
       this.isPlacingSplitOrders = false;
       this.orderPlacementStartTime = 0; // Reset timer
       
+      console.log(`[TradingManager] 🔓 Flags unlocked. isPlacingOrder=${this.isPlacingOrder}, isPlacingSplitOrders=${this.isPlacingSplitOrders}`);
       console.log(`[TradingManager] 🏁 closeAllPositions finished. Final position count: ${this.positions.length}`);
     }
+  }
+
+  /**
+   * Close multiple positions for the same token in ONE aggregated order
+   * This sells cumulative shares in a single transaction
+   */
+  private async closeAggregatedPositions(
+    positions: Position[],
+    tokenId: string,
+    totalSizeUSD: number,
+    direction: 'UP' | 'DOWN',
+    reason: string,
+    isStopLoss: boolean
+  ): Promise<void> {
+    console.log(`[TradingManager] 💰 AGGREGATED CLOSE: Selling ${positions.length} position(s) for token ${tokenId.substring(0, 10)}...`, {
+      totalSizeUSD: totalSizeUSD.toFixed(2),
+      direction,
+      positions: positions.map(p => ({
+        id: p.id.substring(0, 8) + '...',
+        size: p.size.toFixed(2),
+        entryPrice: p.entryPrice.toFixed(2)
+      }))
+    });
+
+    if (!this.apiCredentials) {
+      // Simulation mode
+      const avgEntryPrice = positions.reduce((sum, p) => sum + p.entryPrice * p.size, 0) / totalSizeUSD;
+      const exitPricePercent = avgEntryPrice;
+      const priceDiff = exitPricePercent - avgEntryPrice;
+      const profit = (priceDiff / avgEntryPrice) * totalSizeUSD;
+
+      const exitTrade: Trade = {
+        id: `exit-aggregated-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+        eventSlug: positions[0].eventSlug,
+        tokenId,
+        side: 'SELL',
+        size: totalSizeUSD,
+        price: exitPricePercent,
+        timestamp: Date.now(),
+        status: 'filled',
+        transactionHash: `0x${Math.random().toString(16).substr(2, 64)}`,
+        profit,
+        reason: `Simulated aggregated exit (${positions.length} positions): ${reason}`,
+        orderType: 'MARKET',
+        direction,
+      };
+
+      this.trades.push(exitTrade);
+      this.status.totalTrades++;
+      this.status.totalProfit += profit;
+      this.status.successfulTrades++;
+      this.notifyTradeUpdate(exitTrade);
+      return;
+    }
+
+    // Get current market price for selling
+    if (!this.activeEvent || !this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
+      throw new Error('Cannot close positions: missing event or token IDs');
+    }
+
+    const yesTokenId = this.activeEvent.clobTokenIds[0];
+    const noTokenId = this.activeEvent.clobTokenIds[1];
+
+    const [yesPrice, noPrice] = await Promise.all([
+      this.clobClient.getPrice(yesTokenId, 'SELL'),
+      this.clobClient.getPrice(noTokenId, 'SELL'),
+    ]);
+
+    if (!yesPrice || !noPrice) {
+      throw new Error('Cannot close positions: failed to fetch prices');
+    }
+
+    const yesPricePercent = toPercentage(yesPrice);
+    const noPricePercent = toPercentage(noPrice);
+    const currentPricePercent = direction === 'UP' ? yesPricePercent : noPricePercent;
+    const currentPriceDecimal = currentPricePercent / 100;
+
+    // Calculate total shares from cumulative USD size
+    const totalShares = totalSizeUSD / currentPriceDecimal;
+
+    console.log(`[TradingManager] 📊 AGGREGATED SELL CALCULATION:`, {
+      totalSizeUSD: totalSizeUSD.toFixed(2),
+      currentSellPrice: currentPricePercent.toFixed(4),
+      totalShares: totalShares.toFixed(4),
+      numPositions: positions.length
+    });
+
+    // Place ONE sell order for all cumulative shares
+    const result = await this.placeSingleSellOrder(
+      tokenId,
+      totalSizeUSD,
+      direction,
+      0,
+      1,
+      yesPricePercent,
+      noPricePercent
+    );
+
+    if (!result.success || !result.orderId || result.fillPrice === undefined) {
+      throw new Error(`Aggregated sell order failed: ${result.error || 'Unknown error'}`);
+    }
+
+    // Calculate weighted average entry price
+    const avgEntryPrice = positions.reduce((sum, p) => sum + p.entryPrice * p.size, 0) / totalSizeUSD;
+    const priceDiff = result.fillPrice - avgEntryPrice;
+    const totalProfit = (priceDiff / avgEntryPrice) * totalSizeUSD;
+
+    // Create exit trade record
+    const exitTrade: Trade = {
+      id: `exit-aggregated-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+      eventSlug: positions[0].eventSlug,
+      tokenId,
+      side: 'SELL',
+      size: totalSizeUSD,
+      price: result.fillPrice,
+      timestamp: Date.now(),
+      status: 'filled',
+      transactionHash: result.orderId,
+      profit: totalProfit,
+      reason: `Aggregated exit (${positions.length} positions${isStopLoss ? ' - ⚡STOP LOSS⚡' : ''}): ${reason}`,
+      orderType: 'MARKET',
+      direction,
+    };
+
+    this.trades.push(exitTrade);
+    this.status.totalTrades++;
+    this.status.totalProfit += totalProfit;
+    this.status.successfulTrades++;
+    this.notifyTradeUpdate(exitTrade);
+
+    console.log(`[TradingManager] ✅ AGGREGATED CLOSE SUCCESS:`, {
+      numPositions: positions.length,
+      totalSizeUSD: totalSizeUSD.toFixed(2),
+      avgEntryPrice: avgEntryPrice.toFixed(2),
+      exitPrice: result.fillPrice.toFixed(2),
+      totalProfit: totalProfit.toFixed(2),
+      orderId: result.orderId.substring(0, 12) + '...'
+    });
   }
 
   /**
