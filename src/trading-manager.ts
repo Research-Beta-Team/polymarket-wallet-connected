@@ -26,6 +26,7 @@ export class TradingManager {
   private apiCredentials: { key: string; secret: string; passphrase: string } | null = null; // API credentials for order placement
   private isPlacingOrder: boolean = false; // Flag to prevent multiple simultaneous orders
   private isPlacingSplitOrders: boolean = false; // Flag to track if we're placing split orders
+  private isPlacingExitOrder: boolean = false; // Flag to prevent multiple simultaneous exit orders (separate from entry orders)
   private positions: Position[] = []; // Array of positions instead of single currentPosition
   private priceBelowEntry: boolean = false; // Track if price dropped below entry after position
   private consecutiveFailures: number = 0; // Circuit breaker counter
@@ -204,21 +205,28 @@ export class TradingManager {
 
     // If we have positions, update prices and check exit conditions FIRST (regardless of price difference)
     // Price difference check only applies to entry conditions, not exit conditions
+    // CRITICAL: Exit conditions must ALWAYS be checked, even if entry orders are in progress!
     const activePositions = this.getActivePositions();
     if (activePositions.length > 0) {
-      // Check if exit is already in progress
-      if (this.isPlacingOrder || this.isPlacingSplitOrders) {
+      // Check if EXIT order is already in progress (not entry orders - those shouldn't block exits!)
+      if (this.isPlacingExitOrder) {
         // Don't spam logs, but check if stuck
         const timeSinceOrderStart = Date.now() - this.orderPlacementStartTime;
         if (timeSinceOrderStart > 60000) { // 60 seconds
-          console.error(`[TradingManager] 🚨 EXIT IN PROGRESS FOR ${(timeSinceOrderStart / 1000).toFixed(0)}s - May be stuck!`);
+          console.error(`[TradingManager] 🚨 EXIT ORDER IN PROGRESS FOR ${(timeSinceOrderStart / 1000).toFixed(0)}s - May be stuck!`);
         }
         return; // Skip this check cycle, exit already in progress
       }
       
-      // Update position prices continuously (even if not checking exit conditions)
+      // Log if entry orders are in progress (for debugging, but don't block)
+      if (this.isPlacingOrder || this.isPlacingSplitOrders) {
+        const timeSinceOrderStart = Date.now() - this.orderPlacementStartTime;
+        console.log(`[TradingManager] ℹ️ Entry order in progress (${timeSinceOrderStart}ms), but exit conditions will still be checked`);
+      }
+      
+      // Update position prices continuously (even if entry orders are in progress)
       await this.updatePositionPrices();
-      // Then check exit conditions
+      // Then check exit conditions (CRITICAL: this must always run when positions exist!)
       await this.checkExitConditions();
       return;
     }
@@ -957,18 +965,24 @@ export class TradingManager {
     }
 
     // Prevent multiple simultaneous exit orders
-    if (this.isPlacingOrder || this.isPlacingSplitOrders) {
-      // Check if flags are stuck (order taking too long)
+    // CRITICAL: Only check exit order flag, NOT entry order flags (entry orders shouldn't block exits!)
+    if (this.isPlacingExitOrder) {
+      // Check if exit order is stuck (taking too long)
       const timeSinceOrderStart = Date.now() - this.orderPlacementStartTime;
       if (timeSinceOrderStart > this.MAX_ORDER_PLACEMENT_TIME) {
-        console.error(`[TradingManager] 🚨 FLAGS STUCK! Order placement exceeded ${this.MAX_ORDER_PLACEMENT_TIME}ms. Force resetting flags.`);
-        this.isPlacingOrder = false;
-        this.isPlacingSplitOrders = false;
+        console.error(`[TradingManager] 🚨 EXIT ORDER FLAGS STUCK! Exit order exceeded ${this.MAX_ORDER_PLACEMENT_TIME}ms. Force resetting flags.`);
+        this.isPlacingExitOrder = false;
         this.orderPlacementStartTime = 0;
       } else {
-        console.log(`[TradingManager] ⚠️ checkExitConditions waiting - Order in progress (${timeSinceOrderStart}ms)`);
+        console.log(`[TradingManager] ⚠️ checkExitConditions waiting - Exit order in progress (${timeSinceOrderStart}ms)`);
         return;
       }
+    }
+    
+    // Log if entry orders are in progress (for debugging, but don't block exits)
+    if (this.isPlacingOrder || this.isPlacingSplitOrders) {
+      const timeSinceOrderStart = Date.now() - this.orderPlacementStartTime;
+      console.log(`[TradingManager] ℹ️ Entry order in progress (${timeSinceOrderStart}ms), but exit conditions will still be checked`);
     }
 
     if (!this.activeEvent || !this.activeEvent.clobTokenIds || this.activeEvent.clobTokenIds.length < 2) {
@@ -991,6 +1005,13 @@ export class TradingManager {
       ]);
 
       if (!yesPrice || !noPrice) {
+        console.error(`[TradingManager] ❌ Failed to fetch prices for exit check:`, {
+          yesPrice: yesPrice || 'null',
+          noPrice: noPrice || 'null',
+          yesTokenId: yesTokenId.substring(0, 10) + '...',
+          noTokenId: noTokenId.substring(0, 10) + '...',
+          activePositions: activePositions.length,
+        });
         return;
       }
 
@@ -1000,6 +1021,16 @@ export class TradingManager {
 
       const profitTarget = this.strategyConfig.profitTargetPrice;
       const stopLoss = this.strategyConfig.stopLossPrice;
+
+      // Validate profit target and stop loss are set
+      if (profitTarget === undefined || profitTarget === null || isNaN(profitTarget)) {
+        console.error(`[TradingManager] ❌ Invalid profit target: ${profitTarget}`);
+        return;
+      }
+      if (stopLoss === undefined || stopLoss === null || isNaN(stopLoss)) {
+        console.error(`[TradingManager] ❌ Invalid stop loss: ${stopLoss}`);
+        return;
+      }
 
       // Check exit conditions for ALL positions
       // We exit ALL positions when ANY position meets exit condition
@@ -1033,22 +1064,37 @@ export class TradingManager {
         position.unrealizedProfit = (priceDiff / position.entryPrice) * position.size;
 
         // Check profit target condition
-        if (currentPrice >= profitTarget) {
+        // CRITICAL: Current SELL price must be >= profit target to trigger exit
+        // This ensures we can sell at or above our profit target price
+        const profitTargetMet = currentPrice >= profitTarget;
+        
+        if (profitTargetMet) {
           shouldExit = true;
           exitReason = `Profit target reached at ${currentPrice.toFixed(2)} (Position: ${position.id.substring(0, 8)}...)`;
           triggeringPosition = position;
-          console.log(`[TradingManager] 🎯 Profit target triggered by position ${position.id.substring(0, 8)}... at price ${currentPrice.toFixed(2)}. Will close ALL ${activePositions.length} position(s).`);
+          console.log(`[TradingManager] 🎯🎯🎯 PROFIT TARGET TRIGGERED! Position ${position.id.substring(0, 8)}... at price ${currentPrice.toFixed(2)} >= profit target ${profitTarget.toFixed(2)}. Will close ALL ${activePositions.length} position(s).`);
+          console.log(`[TradingManager] 📊 Profit Target Details:`, {
+            positionId: position.id.substring(0, 8) + '...',
+            direction: direction,
+            entryPrice: position.entryPrice.toFixed(2),
+            currentSellPrice: currentPrice.toFixed(2),
+            profitTarget: profitTarget.toFixed(2),
+            condition: `${currentPrice.toFixed(2)} >= ${profitTarget.toFixed(2)} = ${profitTargetMet}`,
+            priceDifference: (currentPrice - profitTarget).toFixed(2),
+            unrealizedProfit: position.unrealizedProfit?.toFixed(2),
+          });
           break; // Exit all positions on profit target
         }
         
         // Check stop loss condition
+        // CRITICAL: Use <= for stop loss (price at or below stop loss triggers exit)
         if (currentPrice <= stopLoss) {
           shouldExit = true;
           exitReason = `Stop loss triggered at ${currentPrice.toFixed(2)} (Position: ${position.id.substring(0, 8)}...)`;
           useAdaptiveSelling = true;
           isDownDirection = direction === 'DOWN';
           triggeringPosition = position;
-          console.log(`[TradingManager] 🛑 Stop loss triggered by position ${position.id.substring(0, 8)}... at price ${currentPrice.toFixed(2)}. Will close ALL ${activePositions.length} position(s).`);
+          console.log(`[TradingManager] 🛑🛑🛑 STOP LOSS TRIGGERED! Position ${position.id.substring(0, 8)}... at price ${currentPrice.toFixed(2)} <= stop loss ${stopLoss.toFixed(2)}. Will close ALL ${activePositions.length} position(s).`);
           break; // Exit all positions on stop loss
         }
       }
@@ -1056,25 +1102,41 @@ export class TradingManager {
       // Log exit condition check with detailed price comparison
       if (!shouldExit) {
         // Log detailed info for debugging exit conditions
-        const exitCheckLog = {
-          yesSellPrice: yesPricePercent.toFixed(2),
-          noSellPrice: noPricePercent.toFixed(2),
-          profitTarget: profitTarget.toFixed(2),
-          stopLoss: stopLoss.toFixed(2),
-          positions: activePositions.map(p => {
-            const currentPrice = p.currentPrice || 0;
-            return {
-              id: p.id.substring(0, 8),
-              direction: p.direction,
-              entryPrice: p.entryPrice.toFixed(2),
-              currentSellPrice: currentPrice.toFixed(2),
-              profitCheck: `${currentPrice.toFixed(2)} >= ${profitTarget.toFixed(2)} = ${currentPrice >= profitTarget}`,
-              stopLossCheck: `${currentPrice.toFixed(2)} <= ${stopLoss.toFixed(2)} = ${currentPrice <= stopLoss}`,
-              unrealizedProfit: p.unrealizedProfit?.toFixed(2),
-            };
-          }),
-        };
-        console.log(`[TradingManager] Exit check: NO EXIT`, exitCheckLog);
+        // Log if price is very close to stop loss OR profit target
+        const shouldLog = activePositions.some(p => {
+          const currentPrice = p.currentPrice || 0;
+          const distanceToStopLoss = Math.abs(currentPrice - stopLoss);
+          const distanceToProfitTarget = Math.abs(currentPrice - profitTarget);
+          return distanceToStopLoss < 2 || distanceToProfitTarget < 2; // Log if within 2% of either threshold
+        });
+        
+        if (shouldLog) {
+          const exitCheckLog = {
+            yesSellPrice: yesPricePercent.toFixed(2),
+            noSellPrice: noPricePercent.toFixed(2),
+            profitTarget: profitTarget.toFixed(2),
+            stopLoss: stopLoss.toFixed(2),
+            positions: activePositions.map(p => {
+              const currentPrice = p.currentPrice || 0;
+              const distanceToStopLoss = currentPrice - stopLoss;
+              const distanceToProfitTarget = profitTarget - currentPrice;
+              const profitTargetMet = currentPrice >= profitTarget;
+              const stopLossMet = currentPrice <= stopLoss;
+              return {
+                id: p.id.substring(0, 8),
+                direction: p.direction,
+                entryPrice: p.entryPrice.toFixed(2),
+                currentSellPrice: currentPrice.toFixed(2),
+                profitTargetCheck: `${currentPrice.toFixed(2)} >= ${profitTarget.toFixed(2)} = ${profitTargetMet}`,
+                distanceToProfitTarget: distanceToProfitTarget.toFixed(2),
+                stopLossCheck: `${currentPrice.toFixed(2)} <= ${stopLoss.toFixed(2)} = ${stopLossMet}`,
+                distanceToStopLoss: distanceToStopLoss.toFixed(2),
+                unrealizedProfit: p.unrealizedProfit?.toFixed(2),
+              };
+            }),
+          };
+          console.log(`[TradingManager] ⚠️ Exit check: NO EXIT (price near threshold)`, exitCheckLog);
+        }
       }
 
       if (shouldExit) {
@@ -1100,11 +1162,16 @@ export class TradingManager {
             currentSellPrice: p.currentPrice?.toFixed(2),
           })),
           useAdaptiveSelling,
+          isPlacingExitOrder: this.isPlacingExitOrder,
+          isPlacingEntryOrder: this.isPlacingOrder || this.isPlacingSplitOrders,
         });
 
+        // CRITICAL: Exit conditions should ALWAYS execute, even if entry orders are in progress
         if (useAdaptiveSelling) {
+          console.log(`[TradingManager] 🚨 Executing STOP LOSS exit via adaptive selling...`);
           await this.closeAllPositionsWithAdaptiveSelling(exitReason, stopLoss, isDownDirection, yesPricePercent, noPricePercent);
         } else {
+          console.log(`[TradingManager] 🚨 Executing profit target exit...`);
           await this.closeAllPositions(exitReason);
         }
       }
@@ -1304,20 +1371,21 @@ export class TradingManager {
       return;
     }
 
-    if (this.isPlacingOrder || this.isPlacingSplitOrders) {
+    // CRITICAL: Only check exit order flag, not entry order flags
+    if (this.isPlacingExitOrder) {
       console.log('[TradingManager] Exit order already being placed, skipping...');
       return;
     }
 
-    this.isPlacingOrder = true;
-    this.isPlacingSplitOrders = true;
-    this.orderPlacementStartTime = Date.now(); // Track when order placement started
+    // Set exit order flag (separate from entry order flags)
+    this.isPlacingExitOrder = true;
+    this.orderPlacementStartTime = Date.now(); // Track when exit order placement started
 
     const closedPositionIds: string[] = [];
     const failedPositionIds: string[] = [];
     
-    console.log(`[TradingManager] 🔒 Flags locked. isPlacingOrder=${this.isPlacingOrder}, isPlacingSplitOrders=${this.isPlacingSplitOrders}`);
-    console.log(`[TradingManager] 📸 Snapshot taken: ${activePositions.length} position(s) to close`);
+      console.log(`[TradingManager] 🔒 Exit flags locked. isPlacingExitOrder=${this.isPlacingExitOrder}`);
+      console.log(`[TradingManager] 📸 Snapshot taken: ${activePositions.length} position(s) to close`);
     
     // Aggregate positions by token
     const aggregatedByToken = this.aggregatePositionsByToken(activePositions);
@@ -1563,11 +1631,10 @@ export class TradingManager {
         this.notifyStatusUpdate();
       }
     } finally {
-      this.isPlacingOrder = false;
-      this.isPlacingSplitOrders = false;
+      this.isPlacingExitOrder = false;
       this.orderPlacementStartTime = 0; // Reset timer
       
-      console.log(`[TradingManager] 🔓 Flags unlocked. isPlacingOrder=${this.isPlacingOrder}, isPlacingSplitOrders=${this.isPlacingSplitOrders}`);
+      console.log(`[TradingManager] 🔓 Exit flags unlocked. isPlacingExitOrder=${this.isPlacingExitOrder}`);
       console.log(`[TradingManager] 🏁 closeAllPositions finished. Final position count: ${this.positions.length}`);
     }
   }
@@ -1742,7 +1809,7 @@ export class TradingManager {
       return;
     }
 
-    if (this.isPlacingOrder || this.isPlacingSplitOrders) {
+    if (this.isPlacingExitOrder) {
       console.log('[TradingManager] Exit order already being placed, skipping...');
       return;
     }
