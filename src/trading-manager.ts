@@ -469,16 +469,32 @@ export class TradingManager {
       if (this.browserClobClient) {
         const { OrderType, Side } = await import('@polymarket/clob-client');
         
-        // For BUY orders, use BUY side to get ask price
-        const askPriceResponse = await this.browserClobClient.getPrice(tokenId, Side.BUY);
+        // For BUY orders, use SELL side to get ask price (what sellers are asking)
+        // Note: getPrice(tokenId, Side.SELL) returns the ASK price (what you pay to buy)
+        const askPriceResponse = await this.browserClobClient.getPrice(tokenId, Side.SELL);
         // Handle both object {price: "0.96"} and string "0.96" formats
-        const askPrice = typeof askPriceResponse === 'object' && askPriceResponse.price 
+        let askPrice = typeof askPriceResponse === 'object' && askPriceResponse.price 
           ? parseFloat(askPriceResponse.price) 
           : parseFloat(askPriceResponse);
         
         if (isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
           return { success: false, error: 'Invalid market price' };
         }
+        
+        // For FAK orders, add a small buffer (0.5%) to improve fill probability
+        // This ensures we can match immediately even if price moves slightly
+        const slippageBuffer = 0.005; // 0.5% buffer
+        const bufferedAskPrice = Math.min(askPrice * (1 + slippageBuffer), 0.999); // Cap at 0.999 to stay under 1.0
+        
+        console.log(`[TradingManager] Price adjustment for FAK order:`, {
+          originalAskPrice: askPrice.toFixed(4),
+          bufferedAskPrice: bufferedAskPrice.toFixed(4),
+          bufferPercent: (slippageBuffer * 100).toFixed(2) + '%',
+          targetPrice: targetPrice.toFixed(2),
+        });
+        
+        // Use buffered price for better fill probability
+        askPrice = bufferedAskPrice;
 
         // Get fee rate
         let feeRateBps: number;
@@ -491,12 +507,23 @@ export class TradingManager {
           feeRateBps = 1000;
         }
 
+        // For BUY market orders, amount should be in shares, not USD
+        // Convert USD orderSize to shares using the ask price
+        const shares = orderSize / askPrice;
+        
         const marketOrder = {
           tokenID: tokenId,
-          amount: orderSize,
+          amount: shares, // Amount in shares, not USD
           side: Side.BUY,
           feeRateBps: feeRateBps,
         };
+        
+        console.log(`[TradingManager] Market order calculation:`, {
+          orderSizeUSD: orderSize.toFixed(2),
+          askPrice: askPrice.toFixed(4),
+          shares: shares.toFixed(4),
+          estimatedCost: (shares * askPrice).toFixed(2),
+        });
 
         console.log(`[TradingManager] Placing split order ${orderIndex + 1}/${totalOrders} at target price ${targetPrice.toFixed(2)}:`, {
           targetPrice: targetPrice.toFixed(2),
@@ -504,11 +531,44 @@ export class TradingManager {
           orderSize: orderSize.toFixed(2),
         });
 
-        const response = await this.browserClobClient.createAndPostMarketOrder(
-          marketOrder,
-          { negRisk: false },
-          OrderType.FAK
-        );
+        let response;
+        try {
+          response = await this.browserClobClient.createAndPostMarketOrder(
+            marketOrder,
+            { negRisk: false },
+            OrderType.FAK
+          );
+        } catch (orderError: any) {
+          // Handle specific FAK order errors
+          const errorData = orderError?.response?.data || orderError?.data || {};
+          const errorMessage = errorData?.error || orderError?.message || 'Unknown error';
+          
+          // Check if it's a "no match" error for FAK orders
+          if (errorMessage.includes('no orders found to match with FAK order') || 
+              errorMessage.includes('FAK orders are partially filled or killed')) {
+            console.warn(`[TradingManager] ⚠️ FAK order ${orderIndex + 1}/${totalOrders} - No immediate match found at current price:`, {
+              targetPrice: targetPrice.toFixed(2),
+              currentAskPrice: toPercentage(askPrice).toFixed(2),
+              orderSize: orderSize.toFixed(2),
+              error: errorMessage,
+              note: 'FAK orders require immediate match. Price may have moved or no liquidity at this price.',
+            });
+            return { 
+              success: false, 
+              error: `No immediate match for FAK order at ${targetPrice.toFixed(2)}. Price may have moved or insufficient liquidity.` 
+            };
+          }
+          
+          // Other errors
+          console.error(`[TradingManager] ❌ Order ${orderIndex + 1}/${totalOrders} failed with error:`, {
+            error: errorMessage,
+            errorData: errorData,
+            tokenId: tokenId.substring(0, 10) + '...',
+            targetPrice: targetPrice.toFixed(2),
+            orderSize: orderSize.toFixed(2),
+          });
+          return { success: false, error: errorMessage };
+        }
 
         if (response?.orderID) {
           console.log(`[TradingManager] ✅ Order ${orderIndex + 1}/${totalOrders} placed successfully:`, {
@@ -522,10 +582,16 @@ export class TradingManager {
             fillPrice: toPercentage(askPrice),
           };
         } else {
-          const errorMsg = 'No order ID returned from exchange';
-          console.error(`[TradingManager] ❌ Order ${orderIndex + 1}/${totalOrders} failed:`, errorMsg, {
+          // Check if response contains error information
+          const errorData = (response as any)?.error || (response as any)?.data?.error;
+          const errorMsg = errorData || 'No order ID returned from exchange';
+          
+          console.error(`[TradingManager] ❌ Order ${orderIndex + 1}/${totalOrders} failed:`, {
+            error: errorMsg,
             response: response,
             tokenId: tokenId.substring(0, 10) + '...',
+            targetPrice: targetPrice.toFixed(2),
+            orderSize: orderSize.toFixed(2),
           });
           return { success: false, error: errorMsg };
         }
@@ -1263,9 +1329,19 @@ export class TradingManager {
           feeRateBps = 1000;
         }
 
+        // Round shares to reasonable precision (6 decimal places) to avoid floating point issues
+        const roundedShares = Math.round(shares * 1000000) / 1000000;
+        
+        // Validate shares are positive and reasonable
+        if (roundedShares <= 0 || isNaN(roundedShares) || !isFinite(roundedShares)) {
+          const errorMsg = `Invalid shares calculated: ${shares}. Cannot place sell order.`;
+          console.error(`[TradingManager] ❌ SELL order ${orderIndex + 1}/${totalOrders} - ${errorMsg}`);
+          return { success: false, error: errorMsg };
+        }
+        
         const marketOrder = {
           tokenID: tokenId,
-          amount: shares,
+          amount: roundedShares, // Use rounded shares to avoid precision issues
           side: Side.SELL,
           feeRateBps: feeRateBps,
         };
@@ -1276,16 +1352,74 @@ export class TradingManager {
           currentSellPrice: currentPricePercent.toFixed(2),
           yesPricePercent: yesPricePercent.toFixed(2),
           noPricePercent: noPricePercent.toFixed(2),
-          shares: shares.toFixed(4),
+          shares: shares.toFixed(6),
+          roundedShares: roundedShares.toFixed(6),
           estimatedUSD: estimatedUSD.toFixed(2),
           bidPrice: bidPrice.toFixed(4),
+          note: 'Shares calculated from actual filled orders (what you actually own)',
         });
 
-        const response = await this.browserClobClient.createAndPostMarketOrder(
-          marketOrder,
-          { negRisk: false },
-          OrderType.FAK
-        );
+        let response;
+        try {
+          response = await this.browserClobClient.createAndPostMarketOrder(
+            marketOrder,
+            { negRisk: false },
+            OrderType.FAK
+          );
+        } catch (orderError: any) {
+          // Handle specific FAK order errors
+          const errorData = orderError?.response?.data || orderError?.data || {};
+          const errorMessage = errorData?.error || orderError?.message || 'Unknown error';
+          
+          // Check if it's a "no match" error for FAK orders
+          if (errorMessage.includes('no orders found to match with FAK order') || 
+              errorMessage.includes('FAK orders are partially filled or killed')) {
+            console.warn(`[TradingManager] ⚠️ SELL FAK order ${orderIndex + 1}/${totalOrders} - No immediate match found:`, {
+              currentSellPrice: currentPricePercent.toFixed(2),
+              shares: shares.toFixed(4),
+              estimatedUSD: estimatedUSD.toFixed(2),
+              error: errorMessage,
+              note: 'FAK orders require immediate match. Price may have moved or no liquidity at this price.',
+            });
+            return { 
+              success: false, 
+              error: `No immediate match for FAK SELL order at ${currentPricePercent.toFixed(2)}. Price may have moved or insufficient liquidity.` 
+            };
+          }
+          
+          // Check if it's a balance/allowance error
+          if (errorMessage.includes('not enough balance') || errorMessage.includes('allowance') || errorMessage.includes('insufficient')) {
+            console.error(`[TradingManager] 🚫🚫🚫 SELL order ${orderIndex + 1}/${totalOrders} - CRITICAL: Insufficient balance/allowance:`, {
+              error: errorMessage,
+              shares: shares.toFixed(4),
+              estimatedUSD: estimatedUSD.toFixed(2),
+              tokenId: tokenId.substring(0, 10) + '...',
+              direction: direction,
+              currentSellPrice: currentPricePercent.toFixed(2),
+              troubleshooting: [
+                '1. Check token balance in your wallet - you may not have enough shares',
+                '2. Check token allowance - tokens must be approved for the proxy contract',
+                '3. Verify shares calculation is correct (entry price vs current price)',
+                '4. Position may have been partially filled or already sold'
+              ],
+            });
+            return { 
+              success: false, 
+              error: `Insufficient balance/allowance: Cannot sell ${shares.toFixed(4)} shares. Check: 1) Token balance, 2) Token allowance for proxy contract.` 
+            };
+          }
+          
+          // Other errors
+          console.error(`[TradingManager] ❌ SELL order ${orderIndex + 1}/${totalOrders} failed with error:`, {
+            error: errorMessage,
+            errorData: errorData,
+            tokenId: tokenId.substring(0, 10) + '...',
+            currentSellPrice: currentPricePercent.toFixed(2),
+            shares: shares.toFixed(4),
+            estimatedUSD: estimatedUSD.toFixed(2),
+          });
+          return { success: false, error: errorMessage };
+        }
 
         if (response?.orderID) {
           console.log(`[TradingManager] ✅ SELL order ${orderIndex + 1}/${totalOrders} - SUCCESS:`, {
@@ -1298,11 +1432,16 @@ export class TradingManager {
             fillPrice: currentPricePercent,
           };
         } else {
-          const errorMsg = 'No order ID returned from exchange';
+          // Check if response contains error information
+          const errorData = (response as any)?.error || (response as any)?.data?.error;
+          const errorMsg = errorData || 'No order ID returned from exchange';
+          
           console.error(`[TradingManager] ❌ SELL order ${orderIndex + 1}/${totalOrders} - FAILED:`, {
             error: errorMsg,
             response: response,
             tokenId: tokenId.substring(0, 10) + '...',
+            currentSellPrice: currentPricePercent.toFixed(2),
+            shares: shares.toFixed(4),
           });
           return { success: false, error: errorMsg };
         }
@@ -1327,7 +1466,8 @@ export class TradingManager {
   }
 
   /**
-   * Aggregate positions by token to calculate total shares based on entry prices
+   * Aggregate positions by token to calculate total shares based on ACTUAL filled orders
+   * Uses the actual fill prices from filledOrders, not recalculated from entry price
    */
   private aggregatePositionsByToken(positions: Position[]): Map<string, { positions: Position[], totalSize: number, totalShares: number, direction: 'UP' | 'DOWN' }> {
     const aggregated = new Map<string, { positions: Position[], totalSize: number, totalShares: number, direction: 'UP' | 'DOWN' }>();
@@ -1347,10 +1487,36 @@ export class TradingManager {
       agg.positions.push(position);
       agg.totalSize += position.size;
       
-      // Calculate shares based on entry price (what was actually bought)
-      const entryPriceDecimal = position.entryPrice / 100; // Convert percentage to decimal
-      const positionShares = position.size / entryPriceDecimal;
-      agg.totalShares += positionShares;
+      // Calculate shares from ACTUAL filled orders (what was actually received)
+      // This is more accurate than recalculating from entry price
+      if (position.filledOrders && position.filledOrders.length > 0) {
+        // Use actual fill prices from filled orders
+        let positionShares = 0;
+        for (const filledOrder of position.filledOrders) {
+          const fillPriceDecimal = filledOrder.price / 100; // Convert percentage to decimal
+          const orderShares = filledOrder.size / fillPriceDecimal;
+          positionShares += orderShares;
+        }
+        agg.totalShares += positionShares;
+        
+        console.log(`[TradingManager] 📊 Position shares from filled orders:`, {
+          positionId: position.id.substring(0, 8) + '...',
+          numFilledOrders: position.filledOrders.length,
+          totalShares: positionShares.toFixed(4),
+          filledOrders: position.filledOrders.map(fo => ({
+            price: fo.price.toFixed(2),
+            sizeUSD: fo.size.toFixed(2),
+            shares: (fo.size / (fo.price / 100)).toFixed(4)
+          }))
+        });
+      } else {
+        // Fallback: Calculate from entry price if no filledOrders (shouldn't happen, but safety)
+        const entryPriceDecimal = position.entryPrice / 100;
+        const positionShares = position.size / entryPriceDecimal;
+        agg.totalShares += positionShares;
+        
+        console.warn(`[TradingManager] ⚠️ Position ${position.id.substring(0, 8)}... has no filledOrders, using entry price calculation (may be inaccurate)`);
+      }
     }
     
     return aggregated;
@@ -1733,7 +1899,8 @@ export class TradingManager {
       currentSellPrice: currentPricePercent.toFixed(4),
       estimatedUSDValue: (totalShares * (currentPricePercent / 100)).toFixed(2),
       numPositions: positions.length,
-      note: 'Shares calculated from entry prices (actual shares owned)'
+      note: 'Shares calculated from entry prices (actual shares owned)',
+      warning: 'Ensure you have sufficient token balance and allowance for this sell order'
     });
 
     // Place ONE sell order for all cumulative shares (calculated from entry prices)
