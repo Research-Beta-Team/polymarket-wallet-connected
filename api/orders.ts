@@ -238,6 +238,25 @@ export default async function handler(
             marketAmount = size;
           }
 
+          // Validate order parameters
+          if (!tokenId || tokenId.trim() === '') {
+            return res.status(400).json({
+              error: 'Invalid token ID',
+            });
+          }
+          
+          if (!marketAmount || marketAmount <= 0 || isNaN(marketAmount)) {
+            return res.status(400).json({
+              error: `Invalid order amount: ${marketAmount}. Must be a positive number.`,
+            });
+          }
+          
+          if (marketAmount < 0.01) {
+            return res.status(400).json({
+              error: `Order amount too small: ${marketAmount}. Minimum order size is $0.01.`,
+            });
+          }
+
           const marketOrder: UserMarketOrder = {
             tokenID: tokenId,
             amount: marketAmount,
@@ -251,6 +270,8 @@ export default async function handler(
             side: marketOrder.side,
             feeRateBps: marketOrder.feeRateBps,
             negRisk: negRisk ?? false,
+            originalSize: size,
+            orderSide: orderSide === Side.BUY ? 'BUY' : 'SELL',
           });
 
           // Retry logic for Cloudflare protection
@@ -271,7 +292,29 @@ export default async function handler(
                 response: response,
                 hasOrderID: !!response?.orderID,
                 responseKeys: response ? Object.keys(response) : 'null',
+                responseType: typeof response,
+                responseStringified: JSON.stringify(response, null, 2),
               });
+              
+              // Check if response indicates an error
+              if (response && (response.error || response.status === 'error' || (response.status && response.status !== 'success'))) {
+                const errorMsg = response.error || response.message || 'Order submission returned error';
+                console.error('[Orders API] Order submission returned error response:', {
+                  error: errorMsg,
+                  response: response,
+                });
+                
+                // If it's not a Cloudflare block, throw the error
+                if (attempt < maxRetries) {
+                  // Treat as Cloudflare-like error and retry
+                  console.warn(`[Orders API] Retrying due to error response (attempt ${attempt}/${maxRetries})`);
+                  const delay = Math.pow(2, attempt) * 1000;
+                  await new Promise(resolve => setTimeout(resolve, delay));
+                  continue;
+                } else {
+                  throw new Error(errorMsg);
+                }
+              }
               
               // Success - break out of retry loop
               break;
@@ -348,6 +391,24 @@ export default async function handler(
         });
       }
 
+      // Check if response indicates an error before checking for order ID
+      if (response && (response.error || response.status === 'error' || (response.status && response.status !== 'success' && response.status !== 200))) {
+        const errorMsg = response.error || response.message || 'Order submission failed';
+        console.error('[Orders API] Order submission returned error:', {
+          error: errorMsg,
+          response: response,
+          tokenId,
+          side,
+          isMarketOrder,
+        });
+        
+        return res.status(500).json({
+          error: errorMsg,
+          details: response.details || `Order submission failed. Response: ${JSON.stringify(response)}`,
+          status: response.status,
+        });
+      }
+      
       // Check for order ID in various possible fields
       const orderId = response?.orderID || response?.order_id || response?.id || response?.orderId;
       
@@ -377,9 +438,14 @@ export default async function handler(
           isMarketOrder,
         });
         
+        // Extract error message from response if available
+        const errorMsg = response?.error || response?.message || 'Order submission failed - no order ID returned';
+        const errorDetails = response?.details || (response ? `Response received but no order ID found. Response keys: ${Object.keys(response).join(', ')}` : 'No response received');
+        
         return res.status(500).json({
-          error: 'Order submission failed - no order ID returned',
-          details: response ? `Response received but no order ID found. Response keys: ${Object.keys(response).join(', ')}` : 'No response received',
+          error: errorMsg,
+          details: errorDetails,
+          status: response?.status,
         });
       }
     } catch (error: any) {
@@ -389,6 +455,8 @@ export default async function handler(
         status: error?.response?.status || error?.status,
         statusText: error?.response?.statusText || error?.statusText,
         isCloudflareBlock: error?.response?.status === 403 || error?.status === 403,
+        errorData: error?.response?.data || error?.data,
+        errorStack: error instanceof Error ? error.stack : undefined,
       });
       
       // Check for Cloudflare block

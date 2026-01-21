@@ -164,8 +164,15 @@ export class TradingManager {
     if (clobClient) {
       console.log('[TradingManager] Browser ClobClient set - orders will be placed from browser (bypasses Cloudflare)');
     } else {
-      console.log('[TradingManager] Browser ClobClient cleared - will fall back to server-side API');
+      console.log('[TradingManager] Browser ClobClient cleared - server-side API is blocked by Cloudflare, orders will fail');
     }
+  }
+
+  /**
+   * Get browser ClobClient status
+   */
+  getBrowserClobClient(): ClobClient | null {
+    return this.browserClobClient;
   }
 
   /**
@@ -285,6 +292,13 @@ export class TradingManager {
       // Check circuit breaker first
       if (this.consecutiveFailures >= this.MAX_CONSECUTIVE_FAILURES) {
         console.error('[TradingManager] 🔴 Circuit breaker active - trading disabled. Restart trading to reset.');
+        return;
+      }
+      
+      // CRITICAL: Check if browser ClobClient is available
+      // Server-side API is blocked by Cloudflare, so browser client is required
+      if (!this.browserClobClient) {
+        console.error('[TradingManager] ❌ Cannot place orders - Browser ClobClient not initialized. Server-side API is blocked by Cloudflare. Please ensure wallet is connected and browser client is initialized.');
         return;
       }
       
@@ -516,51 +530,16 @@ export class TradingManager {
           return { success: false, error: errorMsg };
         }
       } else {
-        // Fallback to server-side API
-        // For BUY orders, use BUY side to get ask price
-        const askPrice = await this.clobClient.getPrice(tokenId, 'BUY');
-        if (!askPrice || isNaN(askPrice) || askPrice <= 0 || askPrice >= 1) {
-          return { success: false, error: 'Invalid market price' };
-        }
-
-        const shares = orderSize / askPrice;
-
-        const response = await fetch('/api/orders', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            tokenId,
-            size: shares,
-            side: 'BUY',
-            isMarketOrder: true,
-            apiCredentials: this.apiCredentials,
-            negRisk: false,
-          }),
+        // Browser ClobClient not available - cannot place orders
+        // Server-side API is blocked by Cloudflare, so we must use browser client
+        const errorMsg = 'Browser ClobClient not initialized. Cannot place orders - server-side API is blocked by Cloudflare. Please ensure wallet is connected and browser client is initialized.';
+        console.error(`[TradingManager] ❌ Order ${orderIndex + 1}/${totalOrders} cannot be placed:`, {
+          error: errorMsg,
+          tokenId: tokenId.substring(0, 10) + '...',
+          browserClobClientAvailable: !!this.browserClobClient,
+          apiCredentialsAvailable: !!this.apiCredentials,
         });
-
-        const data = await response.json();
-        if (response.ok && data.orderId) {
-          console.log(`[TradingManager] ✅ Order ${orderIndex + 1}/${totalOrders} placed via API:`, {
-            orderId: data.orderId.substring(0, 8) + '...',
-            fillPrice: toPercentage(askPrice).toFixed(2),
-            orderSize: orderSize.toFixed(2),
-          });
-          return {
-            success: true,
-            orderId: data.orderId,
-            fillPrice: toPercentage(askPrice),
-          };
-        } else {
-          const errorMsg = data.error || 'Order failed';
-          console.error(`[TradingManager] ❌ Order ${orderIndex + 1}/${totalOrders} failed via API:`, {
-            error: errorMsg,
-            status: response.status,
-            statusText: response.statusText,
-            data: data,
-            tokenId: tokenId.substring(0, 10) + '...',
-          });
-          return { success: false, error: errorMsg };
-        }
+        return { success: false, error: errorMsg };
       }
     } catch (error) {
       return {
@@ -1328,35 +1307,16 @@ export class TradingManager {
           return { success: false, error: errorMsg };
         }
       } else {
-        // Fallback to server-side API
-        // Use the price from yesPricePercent/noPricePercent (already converted to decimal)
-        if (!bidPrice || isNaN(bidPrice) || bidPrice <= 0 || bidPrice >= 1) {
-          return { success: false, error: 'Invalid market price' };
-        }
-
-        const response = await fetch('/api/orders', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            tokenId,
-            size: shares,
-            side: 'SELL',
-            isMarketOrder: true,
-            apiCredentials: this.apiCredentials,
-            negRisk: false,
-          }),
+        // Browser ClobClient not available - cannot place orders
+        // Server-side API is blocked by Cloudflare, so we must use browser client
+        const errorMsg = 'Browser ClobClient not initialized. Cannot place SELL orders - server-side API is blocked by Cloudflare. Please ensure wallet is connected and browser client is initialized.';
+        console.error(`[TradingManager] ❌ SELL order ${orderIndex + 1}/${totalOrders} cannot be placed:`, {
+          error: errorMsg,
+          tokenId: tokenId.substring(0, 10) + '...',
+          browserClobClientAvailable: !!this.browserClobClient,
+          apiCredentialsAvailable: !!this.apiCredentials,
         });
-
-        const data = await response.json();
-        if (response.ok && data.orderId) {
-          return {
-            success: true,
-            orderId: data.orderId,
-            fillPrice: currentPricePercent,
-          };
-        } else {
-          return { success: false, error: data.error || 'Order failed' };
-        }
+        return { success: false, error: errorMsg };
       }
     } catch (error) {
       return {
@@ -2062,6 +2022,14 @@ export class TradingManager {
 
     if (!this.strategyConfig.enabled) {
       console.warn('Strategy is not enabled');
+      return;
+    }
+
+    // CRITICAL: Check if browser ClobClient is available before starting
+    // Server-side API is blocked by Cloudflare, so browser client is required
+    if (!this.browserClobClient) {
+      console.error('[TradingManager] ❌ Cannot start trading - Browser ClobClient not initialized. Server-side API is blocked by Cloudflare. Please ensure wallet is connected and browser client is initialized.');
+      alert('Cannot start trading: Browser ClobClient not initialized. Please ensure wallet is connected.');
       return;
     }
 

@@ -1257,7 +1257,13 @@ export class StreamingPlatform {
         this.walletState.apiCredentials = data.credentials;
         
         // Initialize browser ClobClient for client-side order placement (bypasses Cloudflare)
+        // CRITICAL: This must succeed - server-side API is blocked by Cloudflare
         await this.initializeBrowserClobClient();
+        
+        // Verify browser client was initialized
+        if (!this.tradingManager.getBrowserClobClient()) {
+          throw new Error('Browser ClobClient initialization failed. Cannot place orders - server-side API is blocked by Cloudflare. Please try reconnecting your wallet.');
+        }
       }
 
       // Fetch balance after initialization
