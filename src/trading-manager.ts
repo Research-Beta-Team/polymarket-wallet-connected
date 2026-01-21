@@ -955,6 +955,9 @@ export class TradingManager {
       return;
     }
     
+    // DEBUG: Log that exit conditions are being checked
+    console.log(`[TradingManager] 🔍 CHECKING EXIT CONDITIONS for ${activePositions.length} position(s) at ${new Date().toISOString()}`);
+    
     // Log position count for tracking
     if (activePositions.length > 1) {
       console.log(`[TradingManager] 👀 Checking exit conditions for ${activePositions.length} POSITIONS:`, activePositions.map(p => ({
@@ -1021,6 +1024,15 @@ export class TradingManager {
 
       const profitTarget = this.strategyConfig.profitTargetPrice;
       const stopLoss = this.strategyConfig.stopLossPrice;
+      
+      // DEBUG: Always log prices when positions exist
+      console.log(`[TradingManager] 📊 Current Market Prices:`, {
+        yesPricePercent: yesPricePercent.toFixed(2),
+        noPricePercent: noPricePercent.toFixed(2),
+        profitTarget: profitTarget.toFixed(2),
+        stopLoss: stopLoss.toFixed(2),
+        activePositions: activePositions.length,
+      });
 
       // Validate profit target and stop loss are set
       if (profitTarget === undefined || profitTarget === null || isNaN(profitTarget)) {
@@ -1062,11 +1074,43 @@ export class TradingManager {
         position.currentPrice = currentPrice;
         const priceDiff = currentPrice - position.entryPrice;
         position.unrealizedProfit = (priceDiff / position.entryPrice) * position.size;
+        
+        // DEBUG: Always log when price is very high (potential profit target issue)
+        if (currentPrice >= 95 || direction === 'DOWN') {
+          console.log(`[TradingManager] 🔍 Position Check:`, {
+            positionId: position.id.substring(0, 8) + '...',
+            direction: direction,
+            entryPrice: position.entryPrice.toFixed(2),
+            currentPrice: currentPrice.toFixed(2),
+            yesPrice: yesPricePercent.toFixed(2),
+            noPrice: noPricePercent.toFixed(2),
+            profitTarget: profitTarget.toFixed(2),
+            stopLoss: stopLoss.toFixed(2),
+          });
+        }
 
         // Check profit target condition
         // CRITICAL: Current SELL price must be >= profit target to trigger exit
         // This ensures we can sell at or above our profit target price
-        const profitTargetMet = currentPrice >= profitTarget;
+        // Use a small epsilon for floating point comparison to handle edge cases
+        const epsilon = 0.01; // 0.01% tolerance
+        const profitTargetMet = currentPrice >= (profitTarget - epsilon);
+        
+        // DEBUG: Always log profit target check for DOWN positions or when price is high
+        if (direction === 'DOWN' || currentPrice >= 95) {
+          console.log(`[TradingManager] 🔍 Profit Target Check:`, {
+            positionId: position.id.substring(0, 8) + '...',
+            direction: direction,
+            entryPrice: position.entryPrice.toFixed(2),
+            currentSellPrice: currentPrice.toFixed(2),
+            profitTarget: profitTarget.toFixed(2),
+            condition: `${currentPrice.toFixed(2)} >= ${(profitTarget - epsilon).toFixed(2)} = ${profitTargetMet}`,
+            priceDifference: (currentPrice - profitTarget).toFixed(2),
+            yesPrice: yesPricePercent.toFixed(2),
+            noPrice: noPricePercent.toFixed(2),
+            rawComparison: `${currentPrice} >= ${profitTarget}`,
+          });
+        }
         
         if (profitTargetMet) {
           shouldExit = true;
@@ -1082,6 +1126,8 @@ export class TradingManager {
             condition: `${currentPrice.toFixed(2)} >= ${profitTarget.toFixed(2)} = ${profitTargetMet}`,
             priceDifference: (currentPrice - profitTarget).toFixed(2),
             unrealizedProfit: position.unrealizedProfit?.toFixed(2),
+            yesPrice: yesPricePercent.toFixed(2),
+            noPrice: noPricePercent.toFixed(2),
           });
           break; // Exit all positions on profit target
         }
