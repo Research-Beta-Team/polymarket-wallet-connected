@@ -2082,19 +2082,45 @@ export class TradingManager {
     const yesPricePercent = toPercentage(yesPrice);
     const noPricePercent = toPercentage(noPrice);
 
-    // Calculate total shares owned based on entry price (what was actually bought)
-    const entryPriceDecimal = position.entryPrice / 100; // Convert percentage to decimal
-    const totalSharesOwned = position.size / entryPriceDecimal;
+    // Calculate total shares owned from ACTUAL filled orders (what was actually received)
+    // This is more accurate than recalculating from entry price
+    let totalSharesOwned = 0;
+    if (position.filledOrders && position.filledOrders.length > 0) {
+      // Use actual fill prices from filled orders
+      for (const filledOrder of position.filledOrders) {
+        const fillPriceDecimal = filledOrder.price / 100; // Convert percentage to decimal
+        const orderShares = filledOrder.size / fillPriceDecimal;
+        totalSharesOwned += orderShares;
+      }
+      
+      console.log(`[TradingManager] 📊 SINGLE POSITION SELL CALCULATION (from filled orders):`, {
+        positionSizeUSD: positionSize.toFixed(2),
+        numFilledOrders: position.filledOrders.length,
+        totalSharesOwned: totalSharesOwned.toFixed(4),
+        filledOrders: position.filledOrders.map(fo => ({
+          price: fo.price.toFixed(2),
+          sizeUSD: fo.size.toFixed(2),
+          shares: (fo.size / (fo.price / 100)).toFixed(4)
+        })),
+        numSplits: numSplits,
+        note: 'Shares calculated from actual filled orders (what you actually own)'
+      });
+    } else {
+      // Fallback: Calculate from entry price if no filledOrders (shouldn't happen, but safety)
+      const entryPriceDecimal = position.entryPrice / 100;
+      totalSharesOwned = position.size / entryPriceDecimal;
+      
+      console.warn(`[TradingManager] ⚠️ Position ${position.id.substring(0, 8)}... has no filledOrders, using entry price calculation (may be inaccurate)`);
+      console.log(`[TradingManager] 📊 SINGLE POSITION SELL CALCULATION (fallback):`, {
+        positionSizeUSD: positionSize.toFixed(2),
+        entryPrice: position.entryPrice.toFixed(2),
+        totalSharesOwned: totalSharesOwned.toFixed(4),
+        numSplits: numSplits,
+        note: '⚠️ Using fallback calculation - may be inaccurate'
+      });
+    }
+    
     const sharesPerSplit = totalSharesOwned / numSplits;
-
-    console.log(`[TradingManager] 📊 SINGLE POSITION SELL CALCULATION:`, {
-      positionSizeUSD: positionSize.toFixed(2),
-      entryPrice: position.entryPrice.toFixed(2),
-      totalSharesOwned: totalSharesOwned.toFixed(4),
-      numSplits: numSplits,
-      sharesPerSplit: sharesPerSplit.toFixed(4),
-      note: 'Shares calculated from entry price (actual shares owned)'
-    });
 
     // Place real sell orders
     let totalProfit = 0;
