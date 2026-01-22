@@ -1,4 +1,5 @@
 import type { DataSource, SubscriptionMessage, PriceUpdate, ConnectionStatus } from './types';
+import { ASSET_CONFIG } from './types';
 
 const WS_ENDPOINT = 'wss://ws-live-data.polymarket.com';
 const PING_INTERVAL = 5000; // 5 seconds
@@ -104,15 +105,16 @@ export class WebSocketClient {
       return;
     }
 
+    // Subscribe to all asset price feeds
+    const subscriptions = Object.values(ASSET_CONFIG).map(asset => ({
+      topic: 'crypto_prices_chainlink',
+      type: '*',
+      filters: `{"symbol":"${asset.symbol}"}`
+    }));
+
     const subscription: SubscriptionMessage = {
       action: 'subscribe',
-      subscriptions: [
-        {
-          topic: 'crypto_prices_chainlink',
-          type: '*',
-          filters: '{"symbol":"btc/usd"}'
-        }
-      ]
+      subscriptions
     };
 
     this.ws.send(JSON.stringify(subscription));

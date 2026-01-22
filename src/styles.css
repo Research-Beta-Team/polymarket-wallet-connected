@@ -1406,3 +1406,36 @@ header h1 {
   }
 }
 
+/* Asset Tabs */
+.asset-tabs {
+  display: flex;
+  gap: 10px;
+  padding: 20px 30px;
+  background: #f8f9fa;
+  border-bottom: 2px solid #e9ecef;
+}
+
+.asset-tab {
+  padding: 12px 24px;
+  border: 2px solid #dee2e6;
+  border-radius: 8px;
+  background: white;
+  color: #495057;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.asset-tab:hover {
+  background: #e9ecef;
+  border-color: #adb5bd;
+}
+
+.asset-tab.active {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  border-color: #667eea;
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+}
+

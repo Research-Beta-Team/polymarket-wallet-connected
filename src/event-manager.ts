@@ -1,5 +1,7 @@
 import { PolymarketAPI, type PolymarketEvent } from './polymarket-api';
 import { getNext15MinIntervals, getPrevious15MinInterval, generateEventSlug, formatTimestamp, formatTimestampForTitle, extractTimestampFromSlug } from './event-utils';
+import type { AssetType } from './types';
+import { ASSET_CONFIG } from './types';
 
 export interface EventDisplayData {
   slug: string;
@@ -22,13 +24,18 @@ export class EventManager {
   private currentEventIndex: number = -1;
   private refreshInterval: number | null = null;
   private onEventsUpdated: (() => void) | null = null;
+  private asset: AssetType;
+
+  constructor(asset: AssetType = 'btc') {
+    this.asset = asset;
+  }
 
   setOnEventsUpdated(callback: () => void): void {
     this.onEventsUpdated = callback;
   }
 
   private createEventFromTimestamp(timestamp: number, event?: PolymarketEvent | null): EventDisplayData {
-    const slug = event?.slug || generateEventSlug(timestamp);
+    const slug = event?.slug || generateEventSlug(timestamp, this.asset);
     const startTimestamp = extractTimestampFromSlug(slug) || timestamp;
     const endTimestamp = startTimestamp + 900; // 15 minutes = 900 seconds
     
@@ -54,7 +61,8 @@ export class EventManager {
     
     // Format title with Dhaka time (GMT+6)
     const titleTime = formatTimestampForTitle(startTimestamp);
-    const title = event?.title || `BTC Up/Down 15m - ${titleTime}`;
+    const assetConfig = ASSET_CONFIG[this.asset];
+    const title = event?.title || `${assetConfig.displayName} Up/Down 15m - ${titleTime}`;
     
     // Extract IDs - handle both direct and nested structures
     // Note: API uses questionID (capital ID) not questionId
@@ -172,11 +180,11 @@ export class EventManager {
     try {
       // Get one expired event (most recent expired)
       const expiredTimestamp = getPrevious15MinInterval();
-      const expiredSlug = generateEventSlug(expiredTimestamp);
+      const expiredSlug = generateEventSlug(expiredTimestamp, this.asset);
       
       // Get current and upcoming events (count - 1 to make room for expired)
       const futureTimestamps = getNext15MinIntervals(count - 1);
-      const futureSlugs = futureTimestamps.map(ts => generateEventSlug(ts));
+      const futureSlugs = futureTimestamps.map(ts => generateEventSlug(ts, this.asset));
       
       // Fetch all events
       const allSlugs = [expiredSlug, ...futureSlugs];

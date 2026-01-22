@@ -1329,8 +1329,8 @@ export class TradingManager {
           feeRateBps = 1000;
         }
 
-        // Round shares to reasonable precision (6 decimal places) to avoid floating point issues
-        const roundedShares = Math.round(shares * 1000000) / 1000000;
+        // Round shares to 2 decimal places before sending to API
+        const roundedShares = Math.round(shares * 100) / 100;
         
         // Validate shares are positive and reasonable
         if (roundedShares <= 0 || isNaN(roundedShares) || !isFinite(roundedShares)) {
@@ -1341,7 +1341,7 @@ export class TradingManager {
         
         const marketOrder = {
           tokenID: tokenId,
-          amount: roundedShares, // Use rounded shares to avoid precision issues
+          amount: roundedShares, // Use rounded shares (2 decimal places)
           side: Side.SELL,
           feeRateBps: feeRateBps,
         };
@@ -1352,8 +1352,8 @@ export class TradingManager {
           currentSellPrice: currentPricePercent.toFixed(2),
           yesPricePercent: yesPricePercent.toFixed(2),
           noPricePercent: noPricePercent.toFixed(2),
-          shares: shares.toFixed(6),
-          roundedShares: roundedShares.toFixed(6),
+          shares: shares.toFixed(8),
+          roundedShares: roundedShares.toFixed(2),
           estimatedUSD: estimatedUSD.toFixed(2),
           bidPrice: bidPrice.toFixed(4),
           note: 'Shares calculated from actual filled orders (what you actually own)',

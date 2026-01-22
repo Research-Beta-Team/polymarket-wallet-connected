@@ -1,5 +1,7 @@
+import type { AssetType } from './types';
+
 /**
- * Calculate 15-minute interval timestamps for BTC up/down events
+ * Calculate 15-minute interval timestamps for up/down events
  * Events occur at :00, :15, :30, :45 of each hour
  */
 
@@ -54,14 +56,33 @@ export function getPrevious15MinInterval(): number {
   return Math.floor(previousInterval.getTime() / 1000);
 }
 
-export function generateEventSlug(timestamp: number): string {
-  return `btc-updown-15m-${timestamp}`;
+/**
+ * Generate event slug for a specific asset
+ * Format: {asset}-updown-15m-{timestamp}
+ */
+export function generateEventSlug(timestamp: number, asset: AssetType = 'btc'): string {
+  return `${asset}-updown-15m-${timestamp}`;
 }
 
+/**
+ * Extract timestamp from event slug
+ * Supports: btc-updown-15m-{timestamp}, eth-updown-15m-{timestamp}, etc.
+ */
 export function extractTimestampFromSlug(slug: string): number | null {
-  const match = slug.match(/btc-updown-15m-(\d+)/);
+  const match = slug.match(/(?:btc|eth|sol|xrp)-updown-15m-(\d+)/);
   if (match && match[1]) {
     return parseInt(match[1], 10);
+  }
+  return null;
+}
+
+/**
+ * Extract asset type from event slug
+ */
+export function extractAssetFromSlug(slug: string): AssetType | null {
+  const match = slug.match(/(btc|eth|sol|xrp)-updown-15m-/);
+  if (match && match[1]) {
+    return match[1] as AssetType;
   }
   return null;
 }
@@ -99,4 +120,3 @@ export function isEventActive(startDate: string, endDate: string): boolean {
   
   return now >= start && now < end;
 }
-
