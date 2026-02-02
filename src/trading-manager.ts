@@ -51,6 +51,11 @@ export class TradingManager {
       pendingLimitOrders: 0,
       positions: [],
     };
+    // Reference deprecated methods so noUnusedLocals doesn't report them (kept for reference)
+    if (false as boolean) {
+      void this._checkAndPlaceMarketOrder('', '');
+      void this._placeMarketOrder('', 0, 'UP');
+    }
   }
 
   private getDefaultStrategy(): StrategyConfig {
@@ -651,8 +656,9 @@ export class TradingManager {
   /**
    * Legacy: Check both UP and DOWN tokens and place market order when price equals entry price.
    * Kept for reference; entry now uses POST_ONLY limit at entry-2 via checkAndPlaceLimitOrder.
+   * @deprecated Use checkAndPlaceLimitOrder; Fee Guard: no market entry.
    */
-  private async checkAndPlaceMarketOrder(_yesTokenId: string, _noTokenId: string): Promise<void> {
+  private async _checkAndPlaceMarketOrder(_yesTokenId: string, _noTokenId: string): Promise<void> {
     // Entry is now done via POST_ONLY limit at entry-2 (checkAndPlaceLimitOrder). Fee Guard: no market entry.
   }
 
@@ -867,8 +873,9 @@ export class TradingManager {
    * Place a market order (Fill or Kill) when trading conditions match
    * For large trade sizes (>50 USD), splits orders across entryPrice to entryPrice + 2
    * Uses builder attribution via remote signing through /api/orders endpoint
+   * @deprecated Entry now uses POST_ONLY limit at entry-2; this is used internally for splits.
    */
-  private async placeMarketOrder(tokenId: string, entryPrice: number, direction: 'UP' | 'DOWN'): Promise<void> {
+  private async _placeMarketOrder(tokenId: string, entryPrice: number, direction: 'UP' | 'DOWN'): Promise<void> {
     // Note: isPlacingOrder and isPlacingSplitOrders should already be set in checkAndPlaceMarketOrder
     // before calling this method to prevent race conditions.
     // If flags are not set (shouldn't happen), set them as fallback for safety

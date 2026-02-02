@@ -87,7 +87,7 @@ export class MultiAssetStreamingPlatform {
       this.handleStatusChange.bind(this)
     );
 
-    this.tradingManager.setOnStatusUpdate((asset, status) => {
+    this.tradingManager.setOnStatusUpdate((asset, _status) => {
       if (asset === this.currentAsset) {
         this.renderTradingSection();
       }
@@ -196,7 +196,7 @@ export class MultiAssetStreamingPlatform {
     const activeEvent = events.find(e => e.status === 'active');
 
     // Price to Beat = first value of the asset for the active event (set once when we have no value yet)
-    if (activeEvent && !this.eventPriceToBeat.has(activeEvent.slug)) {
+    if (activeEvent && price != null && !this.eventPriceToBeat.has(activeEvent.slug)) {
       this.eventPriceToBeat.set(activeEvent.slug, price);
       this.persistEventState(activeEvent.slug);
       this.renderActiveEvent();
@@ -208,12 +208,14 @@ export class MultiAssetStreamingPlatform {
       const state = await fetchEventState();
       if (state.priceToBeat && Object.keys(state.priceToBeat).length > 0) {
         for (const [slug, value] of Object.entries(state.priceToBeat)) {
-          this.eventPriceToBeat.set(slug, value);
+          const num = typeof value === 'number' ? value : Number(value);
+          if (!Number.isNaN(num)) this.eventPriceToBeat.set(slug, num);
         }
       }
       if (state.lastPrice && Object.keys(state.lastPrice).length > 0) {
         for (const [slug, value] of Object.entries(state.lastPrice)) {
-          this.eventLastPrice.set(slug, value);
+          const num = typeof value === 'number' ? value : Number(value);
+          if (!Number.isNaN(num)) this.eventLastPrice.set(slug, num);
         }
       }
     } catch (e) {
@@ -255,7 +257,7 @@ export class MultiAssetStreamingPlatform {
 
   private capturePriceForExpiredEvent(asset: AssetType): void {
     const price = this.assetPrices.get(asset);
-    if (price === null) return;
+    if (price == null) return;
 
     const events = this.eventManager.getEvents(asset);
     
@@ -555,7 +557,7 @@ export class MultiAssetStreamingPlatform {
     const price = this.assetPrices.get(this.currentAsset);
     
     if (priceElement) {
-      priceElement.textContent = price !== null ? `$${price.toFixed(2)}` : '--';
+      priceElement.textContent = price != null ? `$${price.toFixed(2)}` : '--';
     }
 
     if (timestampElement) {
@@ -568,7 +570,7 @@ export class MultiAssetStreamingPlatform {
       }
     }
 
-    if (changeElement && price !== null) {
+    if (changeElement && price != null) {
       const history = this.assetPriceHistory.get(this.currentAsset) || [];
       if (history.length >= 2) {
         const prevPrice = history[history.length - 2].value;
@@ -637,9 +639,9 @@ export class MultiAssetStreamingPlatform {
 
     const priceToBeat = this.eventPriceToBeat.get(activeEvent.slug);
     const currentPrice = this.assetPrices.get(this.currentAsset);
-    const priceToBeatDisplay = priceToBeat !== undefined 
-      ? `$${priceToBeat.toFixed(2)}` 
-      : (currentPrice !== null ? `$${currentPrice.toFixed(2)} (current)` : 'Loading...');
+    const priceToBeatDisplay = priceToBeat !== undefined
+      ? `$${priceToBeat.toFixed(2)}`
+      : (currentPrice != null ? `$${currentPrice.toFixed(2)} (current)` : 'Loading...');
 
     const upPrice = this.assetUpPrices.get(this.currentAsset);
     const downPrice = this.assetDownPrices.get(this.currentAsset);
@@ -654,13 +656,13 @@ export class MultiAssetStreamingPlatform {
           </div>
           <div class="info-row">
             <span class="info-label">Current ${ASSET_CONFIG[this.currentAsset].displayName} Price:</span>
-            <span class="info-value">${currentPrice !== null ? `$${currentPrice.toFixed(2)}` : 'Loading...'}</span>
+            <span class="info-value">${currentPrice != null ? `$${currentPrice.toFixed(2)}` : 'Loading...'}</span>
           </div>
           <div class="info-row">
             <span class="info-label">Time Remaining:</span>
             <span class="info-value" id="countdown">Calculating...</span>
           </div>
-          ${upPrice !== null && downPrice !== null ? `
+          ${upPrice != null && downPrice != null ? `
             <div class="info-row">
               <span class="info-label">UP Price:</span>
               <span class="info-value">${upPrice.toFixed(2)}%</span>
@@ -681,7 +683,7 @@ export class MultiAssetStreamingPlatform {
     this.startCountdown(activeEvent);
   }
 
-  private startCountdown(event: any): void {
+  private startCountdown(_event: { endDate: string }): void {
     this.stopCountdown();
     this.countdownInterval = window.setInterval(() => {
       this.updateCountdown();
@@ -714,7 +716,7 @@ export class MultiAssetStreamingPlatform {
     
     if (timeLeft === 0) {
       const price = this.assetPrices.get(this.currentAsset);
-      if (price !== null) {
+      if (price != null) {
         const activeIndex = events.findIndex(e => e.status === 'active');
         const nextEvent = events[activeIndex + 1];
         if (nextEvent && !this.eventLastPrice.has(nextEvent.slug)) {
@@ -1123,7 +1125,6 @@ export class MultiAssetStreamingPlatform {
 
       const orders = data.orders || [];
       const positions = this.tradingManager.getPositions(this.currentAsset);
-      const trades = this.tradingManager.getTrades(this.currentAsset);
 
       // Render positions
       const positionRows = positions.map((position, index) => {

@@ -1,7 +1,6 @@
 import { EventManager } from './event-manager';
 import type { EventDisplayData } from './event-manager';
 import type { AssetType } from './types';
-import { generateEventSlug } from './event-utils';
 
 /**
  * Multi-Asset Event Manager

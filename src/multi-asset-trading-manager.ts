@@ -159,23 +159,12 @@ export class MultiAssetTradingManager {
   }
 
   /**
-   * Initialize browser CLOB client for a specific asset (or all if asset is null)
+   * Initialize browser CLOB client for a specific asset (or all if asset is null).
+   * Actual initialization is done by the platform (fetch key, create client) which then
+   * calls setBrowserClobClient on each TradingManager. This method is a no-op for API compatibility.
    */
-  async initializeBrowserClobClient(asset: AssetType | null, eoaAddress: string, proxyAddress: string): Promise<void> {
-    if (asset) {
-      const manager = this.managers.get(asset);
-      if (manager) {
-        await manager.initializeBrowserClobClient(eoaAddress, proxyAddress);
-      }
-    } else {
-      // Initialize for all assets
-      const promises = Array.from(this.managers.values()).map(manager =>
-        manager.initializeBrowserClobClient(eoaAddress, proxyAddress).catch(error => {
-          console.error(`Error initializing browser CLOB client:`, error);
-        })
-      );
-      await Promise.allSettled(promises);
-    }
+  async initializeBrowserClobClient(_asset: AssetType | null, _eoaAddress: string, _proxyAddress: string): Promise<void> {
+    // No-op: platform initializes the client and sets it via manager.setBrowserClobClient(browserClobClient)
   }
 
   /**
