@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 {
   "functions": {
     "api/**/*.ts": {
@@ -21,3 +22,28 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist"
 }
+=======
+{
+  "functions": {
+    "api/**/*.ts": {
+      "runtime": "@vercel/node@5.5.16"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/polymarket/(.*)",
+      "destination": "/api/polymarket/[...path]"
+    },
+    { "source": "/api/event-state", "destination": "/api/data/event-state" },
+    { "source": "/api/event-state/(.*)", "destination": "/api/data/event-state" },
+    { "source": "/api/strategy-config", "destination": "/api/data/strategy-config" },
+    { "source": "/api/strategy-config/(.*)", "destination": "/api/data/strategy-config" },
+    { "source": "/api/trades", "destination": "/api/data/trades" },
+    { "source": "/api/trades/(.*)", "destination": "/api/data/trades" },
+    { "source": "/api/positions", "destination": "/api/data/positions" },
+    { "source": "/api/positions/(.*)", "destination": "/api/data/positions" }
+  ],
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist"
+}
+>>>>>>> 2f473d52c73e8762fcf5f77af1049fde87a86a0e
