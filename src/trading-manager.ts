@@ -18,6 +18,9 @@ export class TradingManager {
   private status: TradingStatus;
   private onStatusUpdate: ((status: TradingStatus) => void) | null = null;
   private onTradeUpdate: ((trade: Trade) => void) | null = null;
+  private onStrategySave: ((config: StrategyConfig) => void) | null = null;
+  private onTradePersist: ((trade: Trade) => void) | null = null;
+  private onPositionsPersist: ((positions: Position[]) => void) | null = null;
   private isMonitoring: boolean = false; // Flag to control continuous monitoring loop
   private activeEvent: EventDisplayData | null = null;
   private pendingLimitOrders: Map<string, Trade> = new Map(); // Map of tokenId -> pending limit order
@@ -33,6 +36,8 @@ export class TradingManager {
   private readonly MAX_CONSECUTIVE_FAILURES = 5; // Circuit breaker threshold
   private orderPlacementStartTime: number = 0; // Track when order placement started
   private readonly MAX_ORDER_PLACEMENT_TIME = 30000; // 30 seconds max for order placement
+  private pendingEntryOrders: Map<string, { orderId: string; direction: 'UP' | 'DOWN'; size: number; limitPrice: number; placedAt: number }> = new Map();
+  private pendingProfitSellOrders: Map<string, string[]> = new Map(); // orderId -> position ids
 
   constructor() {
     this.clobClient = new CLOBClientWrapper();
@@ -55,12 +60,20 @@ export class TradingManager {
       profitTargetPrice: 99, // Take profit at 100
       stopLossPrice: 91, // Stop loss at 91
       tradeSize: 50, // $50 trade size
+      flipGuardPendingDistanceUsd: 15,
+      flipGuardFilledDistanceUsd: 5,
+      entryTimeRemainingMaxSeconds: 180,
     };
   }
 
   setStrategyConfig(config: Partial<StrategyConfig>): void {
     this.strategyConfig = { ...this.strategyConfig, ...config };
     this.saveStrategyConfig();
+  }
+
+  /** Alias for setStrategyConfig (used by multi-asset wrapper). */
+  updateStrategyConfig(config: Partial<StrategyConfig>): void {
+    this.setStrategyConfig(config);
   }
 
   getStrategyConfig(): StrategyConfig {
@@ -70,8 +83,18 @@ export class TradingManager {
   private saveStrategyConfig(): void {
     try {
       localStorage.setItem('tradingStrategy', JSON.stringify(this.strategyConfig));
+      this.onStrategySave?.(this.strategyConfig);
     } catch (error) {
       console.warn('Failed to save strategy config:', error);
+    }
+  }
+
+  /**
+   * Load strategy from an object (e.g. from API). Does not trigger save.
+   */
+  loadStrategyFromObject(config: Partial<StrategyConfig>): void {
+    if (config && typeof config === 'object') {
+      this.strategyConfig = { ...this.strategyConfig, ...config };
     }
   }
 
@@ -84,6 +107,42 @@ export class TradingManager {
     } catch (error) {
       console.warn('Failed to load strategy config:', error);
     }
+  }
+
+  setOnStrategySave(callback: (config: StrategyConfig) => void): void {
+    this.onStrategySave = callback;
+  }
+
+  setOnTradePersist(callback: (trade: Trade) => void): void {
+    this.onTradePersist = callback;
+  }
+
+  setOnPositionsPersist(callback: (positions: Position[]) => void): void {
+    this.onPositionsPersist = callback;
+  }
+
+  setTrades(trades: Trade[]): void {
+    this.trades = Array.isArray(trades) ? [...trades] : [];
+    this.recomputeStatusFromTradesAndPositions();
+    this.notifyStatusUpdate();
+  }
+
+  setPositions(positions: Position[]): void {
+    this.positions = Array.isArray(positions) ? [...positions] : [];
+    this.status.positions = [...this.positions];
+    this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+    this.notifyStatusUpdate();
+  }
+
+  private recomputeStatusFromTradesAndPositions(): void {
+    this.status.totalTrades = this.trades.length;
+    this.status.successfulTrades = this.trades.filter((t) => t.status === 'filled').length;
+    this.status.failedTrades = this.trades.filter((t) => t.status === 'failed').length;
+    this.status.totalProfit = this.trades.reduce((sum, t) => sum + (t.profit ?? 0), 0);
+  }
+
+  private persistPositions(): void {
+    this.onPositionsPersist?.(this.positions);
   }
 
   setOnStatusUpdate(callback: (status: TradingStatus) => void): void {
@@ -149,6 +208,90 @@ export class TradingManager {
     }
   }
 
+  /** Time remaining until event end (seconds). */
+  private getTimeRemainingSeconds(): number | null {
+    if (!this.activeEvent?.endDate) return null;
+    const endMs = new Date(this.activeEvent.endDate).getTime();
+    return Math.max(0, (endMs - Date.now()) / 1000);
+  }
+
+  /** Price distance in USD (|priceToBeat - currentPrice|). */
+  private getPriceDistanceUSD(): number | null {
+    if (this.currentPrice === null || this.priceToBeat === null) return null;
+    return Math.abs(this.priceToBeat - this.currentPrice);
+  }
+
+  /** Cancel a single order by ID (Fee Guard: only for Flip Guard cancel of pending bids). */
+  private async cancelOrderById(orderId: string): Promise<boolean> {
+    if (!this.browserClobClient) return false;
+    try {
+      await this.browserClobClient.cancelOrder({ orderID: orderId });
+      return true;
+    } catch (e) {
+      console.warn('[TradingManager] cancelOrderById failed:', orderId, e);
+      return false;
+    }
+  }
+
+  /** Flip Guard: cancel all pending entry (POST_ONLY) bids. */
+  private async cancelAllPendingEntryOrders(): Promise<void> {
+    for (const [, info] of this.pendingEntryOrders.entries()) {
+      const ok = await this.cancelOrderById(info.orderId);
+      if (ok) console.log(`[TradingManager] Cancelled pending entry order ${info.orderId.substring(0, 8)}... (${info.direction})`);
+    }
+    this.pendingEntryOrders.clear();
+  }
+
+  /** Check if any pending entry (POST_ONLY) orders have filled and create positions. */
+  private async checkPendingEntryOrderFills(): Promise<void> {
+    if (!this.browserClobClient || this.pendingEntryOrders.size === 0) return;
+    try {
+      const openOrders = await this.browserClobClient.getOpenOrders();
+      const openIds = new Set((openOrders || []).map((o: { id?: string }) => o.id || (o as any).orderID));
+      for (const [tokenId, info] of this.pendingEntryOrders.entries()) {
+        if (openIds.has(info.orderId)) continue;
+        // Order no longer open → treat as filled
+        this.pendingEntryOrders.delete(tokenId);
+        const newPosition: Position = {
+          id: `position-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          eventSlug: this.activeEvent!.slug,
+          tokenId,
+          side: 'BUY',
+          size: info.size,
+          entryPrice: info.limitPrice,
+          direction: info.direction,
+          filledOrders: [{ orderId: info.orderId, price: info.limitPrice, size: info.size, timestamp: info.placedAt }],
+          entryTimestamp: info.placedAt,
+        };
+        this.positions.push(newPosition);
+        this.status.positions = [...this.positions];
+        this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+        this.status.successfulTrades++;
+        const trade: Trade = {
+          id: `limit-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+          eventSlug: this.activeEvent!.slug,
+          tokenId,
+          side: 'BUY',
+          size: info.size,
+          price: info.limitPrice,
+          timestamp: Date.now(),
+          status: 'filled',
+          transactionHash: info.orderId,
+          reason: `POST_ONLY limit entry at ${info.limitPrice.toFixed(2)} (${info.direction})`,
+          orderType: 'LIMIT',
+          limitPrice: info.limitPrice,
+          direction: info.direction,
+        };
+        this.trades.push(trade);
+        this.notifyTradeUpdate(trade);
+        this.notifyStatusUpdate();
+        console.log('[TradingManager] ✅ Pending entry order filled:', info.orderId.substring(0, 8), info.direction, info.size.toFixed(2));
+      }
+    } catch (e) {
+      console.warn('[TradingManager] checkPendingEntryOrderFills error:', e);
+    }
+  }
+
   /**
    * Set API credentials for order placement
    */
@@ -210,10 +353,28 @@ export class TradingManager {
       return;
     }
 
+    const activePositions = this.getActivePositions();
+    const priceDistanceUSD = this.getPriceDistanceUSD();
+
+    const flipGuardPending = this.strategyConfig.flipGuardPendingDistanceUsd ?? 15;
+    const flipGuardFilled = this.strategyConfig.flipGuardFilledDistanceUsd ?? 5;
+    // Flip Guard: If in entry position (pending bids) and price distance below threshold, cancel pending bids
+    if (this.pendingEntryOrders.size > 0 && priceDistanceUSD !== null && priceDistanceUSD < flipGuardPending) {
+      console.log(`[TradingManager] 🔄 Flip Guard: Price distance $${priceDistanceUSD.toFixed(2)} < $${flipGuardPending} — cancelling pending entry bids`);
+      await this.cancelAllPendingEntryOrders();
+      return;
+    }
+
+    // Flip Guard: If filled and price distance below threshold, execute Emergency Market Sell (only exception to Fee Guard)
+    if (activePositions.length > 0 && priceDistanceUSD !== null && priceDistanceUSD < flipGuardFilled) {
+      console.log(`[TradingManager] 🚨 Flip Guard: Price distance $${priceDistanceUSD.toFixed(2)} < $${flipGuardFilled} — executing Emergency Market Sell`);
+      await this.closeAllPositions('Flip Guard: distance below threshold — Emergency Market Sell', true);
+      return;
+    }
+
     // If we have positions, update prices and check exit conditions FIRST (regardless of price difference)
     // Price difference check only applies to entry conditions, not exit conditions
     // CRITICAL: Exit conditions must ALWAYS be checked, even if entry orders are in progress!
-    const activePositions = this.getActivePositions();
     if (activePositions.length > 0) {
       // Check if EXIT order is already in progress (not entry orders - those shouldn't block exits!)
       if (this.isPlacingExitOrder) {
@@ -243,22 +404,18 @@ export class TradingManager {
       return; // Don't check entry conditions if order is being placed
     }
 
-    // Price Difference condition check - only applies to entry conditions (when no position exists)
-    if (this.strategyConfig.priceDifference !== null && this.strategyConfig.priceDifference !== undefined) {
-      if (this.currentPrice === null || this.priceToBeat === null) {
-        // Need both prices to check condition
-        return;
-      }
+    // Price Difference: only enter when actual price distance is GREATER than the input value
+    if (this.strategyConfig.priceDifference != null) {
+      if (this.currentPrice === null || this.priceToBeat === null) return;
+      const priceDiffUSD = this.getPriceDistanceUSD()!;
+      if (priceDiffUSD <= this.strategyConfig.priceDifference) return;
+    }
 
-      const priceDiff = Math.abs(this.priceToBeat - this.currentPrice);
-      const targetDiff = this.strategyConfig.priceDifference;
-      const threshold = 0.01; // Small threshold for floating point comparison
-
-      // Only proceed if price difference matches (within threshold)
-      if (Math.abs(priceDiff - targetDiff) > threshold) {
-        // Price difference condition not met, skip trading
-        return;
-      }
+    // Time remaining must be below configured max (default 3 min) for entry
+    const entryTimeMax = this.strategyConfig.entryTimeRemainingMaxSeconds ?? 180;
+    const timeRemaining = this.getTimeRemainingSeconds();
+    if (timeRemaining === null || timeRemaining >= entryTimeMax) {
+      return;
     }
 
     // Prevent multiple simultaneous orders
@@ -266,9 +423,12 @@ export class TradingManager {
       return;
     }
 
-    // Check pending limit orders for both tokens (legacy support - market orders are immediate)
-    // Note: Market orders (FAK) execute immediately, so we don't need to check for pending orders
-    // This check is kept for backward compatibility with any existing pending limit orders
+    // If we have pending entry (POST_ONLY limit) orders, check for fills before placing new ones
+    if (this.pendingEntryOrders.size > 0) {
+      await this.checkPendingEntryOrderFills();
+      return;
+    }
+
     if (this.pendingLimitOrders.has(yesTokenId)) {
       await this.checkLimitOrderFill(yesTokenId);
       return;
@@ -278,134 +438,222 @@ export class TradingManager {
       return;
     }
 
-    // Check both tokens and place market order (Fill or Kill) on whichever reaches entry price first
-    // Market orders execute immediately with builder attribution via remote signing
-    await this.checkAndPlaceMarketOrder(yesTokenId, noTokenId);
+    // Entry: POST_ONLY limit order at entry-2 when up/down crosses entry, time < 3 min, price diff > input
+    await this.checkAndPlaceLimitOrder(yesTokenId, noTokenId);
   }
 
   /**
-   * Check both UP and DOWN tokens and place market order when price equals entry price
-   * Order is filled when UP or DOWN value equals entryPrice (exact match)
+   * Entry: POST_ONLY limit order at entry-2 when up/down crosses entry, time < 3 min, price diff > input.
+   * Fee Guard: only POST_ONLY limit orders for entry (no taker fee).
    */
-  private async checkAndPlaceMarketOrder(yesTokenId: string, noTokenId: string): Promise<void> {
+  private async checkAndPlaceLimitOrder(yesTokenId: string, noTokenId: string): Promise<void> {
     try {
-      // Check circuit breaker first
-      if (this.consecutiveFailures >= this.MAX_CONSECUTIVE_FAILURES) {
-        console.error('[TradingManager] 🔴 Circuit breaker active - trading disabled. Restart trading to reset.');
-        return;
-      }
-      
-      // CRITICAL: Check if browser ClobClient is available
-      // Server-side API is blocked by Cloudflare, so browser client is required
-      if (!this.browserClobClient) {
-        console.error('[TradingManager] ❌ Cannot place orders - Browser ClobClient not initialized. Server-side API is blocked by Cloudflare. Please ensure wallet is connected and browser client is initialized.');
-        return;
-      }
-      
-      // Check if already placing an order (additional safeguard against race condition)
-      if (this.isPlacingOrder || this.isPlacingSplitOrders) {
-        console.log('[TradingManager] Order already being placed, skipping checkAndPlaceMarketOrder...');
-        return;
-      }
+      if (this.consecutiveFailures >= this.MAX_CONSECUTIVE_FAILURES) return;
+      if (!this.browserClobClient) return;
+      if (this.isPlacingOrder || this.isPlacingSplitOrders) return;
 
-      // Get active positions for this event
       const activePositions = this.getActivePositions();
       const totalPositionSize = activePositions.reduce((sum, p) => sum + p.size, 0);
-
-      // Check if we've reached 50% limit
-      if (this.status.maxPositionSize && totalPositionSize >= this.status.maxPositionSize) {
-        console.log(`[TradingManager] Max position size reached: ${totalPositionSize.toFixed(2)} >= ${this.status.maxPositionSize.toFixed(2)}`);
-        return;
-      }
-
-      // Check if adding new position would exceed 50% limit
       const tradeSize = this.strategyConfig.tradeSize;
-      if (this.status.maxPositionSize && (totalPositionSize + tradeSize) > this.status.maxPositionSize) {
-        console.log(`[TradingManager] Adding position would exceed limit. Current: ${totalPositionSize.toFixed(2)}, Adding: ${tradeSize.toFixed(2)}, Max: ${this.status.maxPositionSize.toFixed(2)}`);
-        return;
-      }
+      if (this.status.maxPositionSize && totalPositionSize >= this.status.maxPositionSize) return;
+      if (this.status.maxPositionSize && (totalPositionSize + tradeSize) > this.status.maxPositionSize) return;
 
       const entryPrice = this.strategyConfig.entryPrice;
-
-      // Get current market prices for both tokens (BUY side for entry condition checking)
       const [yesPrice, noPrice] = await Promise.all([
         this.clobClient.getPrice(yesTokenId, 'BUY'),
         this.clobClient.getPrice(noTokenId, 'BUY'),
       ]);
+      if (!yesPrice || !noPrice) return;
 
-      if (!yesPrice || !noPrice) {
-        return;
-      }
-
-      // Convert to percentage scale (0-100)
       const yesPricePercent = toPercentage(yesPrice);
       const noPricePercent = toPercentage(noPrice);
-
-      // Check if either token price is at or below entry price (better for fast markets)
+      const tolerance = 0.5;
       let tokenToTrade: string | null = null;
       let direction: 'UP' | 'DOWN' | null = null;
-      const tolerance = 0.5; // Allow entry within 0.5 of entry price for better execution
 
-      // Check UP token first (YES token) - enter when price <= entryPrice
       if (yesPricePercent <= entryPrice + tolerance && yesPricePercent >= entryPrice - tolerance) {
         tokenToTrade = yesTokenId;
         direction = 'UP';
-        console.log(`[TradingManager] Entry condition met: yesTokenPrice ${yesPricePercent.toFixed(2)} near entryPrice ${entryPrice.toFixed(2)} → Filling UP position`);
-      }
-      // Check DOWN token (NO token) - only if UP token hasn't matched
-      else if (noPricePercent <= entryPrice + tolerance && noPricePercent >= entryPrice - tolerance) {
+      } else if (noPricePercent <= entryPrice + tolerance && noPricePercent >= entryPrice - tolerance) {
         tokenToTrade = noTokenId;
         direction = 'DOWN';
-        console.log(`[TradingManager] Entry condition met: noTokenPrice ${noPricePercent.toFixed(2)} near entryPrice ${entryPrice.toFixed(2)} → Filling DOWN position`);
       } else {
-        // Price is not at entry - mark that we can re-enter if it comes back to entry price
-        // Only set flag if price is BELOW entry (not just not equal)
         if (activePositions.length > 0) {
           const currentPrice = yesPricePercent >= noPricePercent ? yesPricePercent : noPricePercent;
-          if (currentPrice < entryPrice - tolerance) {
-            this.priceBelowEntry = true;
-          }
-        }
-        // Log why entry condition wasn't met for debugging (less verbose)
-        if (yesPricePercent < entryPrice - 5 && noPricePercent < entryPrice - 5) {
-          console.log(`[TradingManager] Entry condition not met: prices too low (YES: ${yesPricePercent.toFixed(2)}, NO: ${noPricePercent.toFixed(2)}, Entry: ${entryPrice.toFixed(2)})`);
+          if (currentPrice < entryPrice - tolerance) this.priceBelowEntry = true;
         }
         return;
       }
 
-      // Check if we should enter (re-entry logic)
       if (activePositions.length > 0) {
-        // We have positions - check if price dropped below entry and came back to exact entry price
-        if (!this.priceBelowEntry) {
-          // Price never dropped below entry, don't re-enter
-          console.log(`[TradingManager] Price never dropped below entry, not re-entering. Current positions: ${activePositions.length}`);
-          return;
-        }
-        // Price dropped below entry and came back to exact entry price - allow re-entry
-        console.log(`[TradingManager] Price dropped below entry and came back to exact entry price, allowing re-entry. Current positions: ${activePositions.length}`);
-        this.priceBelowEntry = false; // Reset flag
+        if (!this.priceBelowEntry) return;
+        this.priceBelowEntry = false;
       }
 
-      // Place market order when price reaches entry price
-      if (tokenToTrade && direction) {
-        // Set flags IMMEDIATELY to prevent race condition
-        // This prevents another call from entering while we're placing the order
-        this.isPlacingOrder = true;
-        this.isPlacingSplitOrders = true;
-        this.orderPlacementStartTime = Date.now(); // Track when order placement started
-        
-        try {
-          await this.placeMarketOrder(tokenToTrade, entryPrice, direction);
-        } catch (error) {
-          // Don't reset flags here - let finally block handle it
-          console.error('[TradingManager] Error in placeMarketOrder:', error);
+      if (!tokenToTrade || !direction) return;
+      if (!this.verifyBalance(tradeSize)) return;
+
+      this.isPlacingOrder = true;
+      this.orderPlacementStartTime = Date.now();
+      try {
+        const result = await this.placePostOnlyEntryLimitOrder(tokenToTrade, entryPrice, tradeSize, direction);
+        if (result?.orderId) {
+          this.pendingEntryOrders.set(tokenToTrade, {
+            orderId: result.orderId,
+            direction,
+            size: tradeSize,
+            limitPrice: entryPrice - 2,
+            placedAt: Date.now(),
+          });
+          this.consecutiveFailures = 0;
+          console.log(`[TradingManager] POST_ONLY limit entry placed at ${(entryPrice - 2).toFixed(2)} (${direction}), orderId: ${result.orderId.substring(0, 8)}...`);
+        } else {
+          this.consecutiveFailures++;
         }
-        // Note: placeMarketOrder will reset flags in its finally block
+      } finally {
+        this.isPlacingOrder = false;
+        this.orderPlacementStartTime = 0;
       }
     } catch (error) {
-      console.error('[TradingManager] Error checking for market order placement:', error);
-      // Don't reset flags here - they will be reset in placeMarketOrder's finally block
+      console.error('[TradingManager] checkAndPlaceLimitOrder error:', error);
+      this.consecutiveFailures++;
+      this.isPlacingOrder = false;
+      this.orderPlacementStartTime = 0;
     }
+  }
+
+  /** Place a single POST_ONLY limit BUY at entry-2 (Fee Guard: maker-only, no taker fee). */
+  private async placePostOnlyEntryLimitOrder(
+    tokenId: string,
+    entryPrice: number,
+    tradeSize: number,
+    direction: 'UP' | 'DOWN'
+  ): Promise<{ orderId?: string; error?: string }> {
+    if (!this.browserClobClient || !this.apiCredentials) return { error: 'No client or credentials' };
+    const limitPricePercent = Math.max(0, entryPrice - 2);
+    const limitPriceDecimal = limitPricePercent / 100;
+    const sizeInShares = tradeSize / limitPriceDecimal;
+
+    try {
+      let feeRateBps: number;
+      try {
+        feeRateBps = await this.browserClobClient.getFeeRateBps(tokenId);
+        if (!feeRateBps || feeRateBps === 0) feeRateBps = 1000;
+      } catch {
+        feeRateBps = 1000;
+      }
+
+      const { OrderType, Side } = await import('@polymarket/clob-client');
+      const order: { tokenID: string; price: number; size: number; side: typeof Side.BUY; feeRateBps: number; expiration: number; taker: string } = {
+        tokenID: tokenId,
+        price: limitPriceDecimal,
+        size: sizeInShares,
+        side: Side.BUY,
+        feeRateBps,
+        expiration: 0,
+        taker: '0x0000000000000000000000000000000000000000',
+      };
+
+      const options = { negRisk: false, postOnly: true } as { negRisk: boolean; postOnly?: boolean };
+      const response = await this.browserClobClient.createAndPostOrder(order, options, OrderType.GTC);
+      const orderId = response?.orderID || (response as any)?.order_id || (response as any)?.id;
+      if (orderId) {
+        console.log(`[TradingManager] POST_ONLY limit BUY placed at ${limitPricePercent.toFixed(2)} (${direction})`);
+        return { orderId };
+      }
+      return { error: (response as any)?.errorMsg || (response as any)?.error || 'No order ID' };
+    } catch (e: any) {
+      const msg = e?.message || e?.errorMsg || String(e);
+      return { error: msg };
+    }
+  }
+
+  /** Place POST_ONLY limit SELL at profit target (Fee Guard: maker-only). */
+  private async placePostOnlyLimitSellOrder(
+    tokenId: string,
+    shares: number,
+    limitPricePercent: number
+  ): Promise<{ orderId?: string; error?: string }> {
+    if (!this.browserClobClient || !this.apiCredentials) return { error: 'No client or credentials' };
+    const limitPriceDecimal = limitPricePercent / 100;
+    try {
+      let feeRateBps: number;
+      try {
+        feeRateBps = await this.browserClobClient.getFeeRateBps(tokenId);
+        if (!feeRateBps || feeRateBps === 0) feeRateBps = 1000;
+      } catch {
+        feeRateBps = 1000;
+      }
+      const { OrderType, Side } = await import('@polymarket/clob-client');
+      const order = {
+        tokenID: tokenId,
+        price: limitPriceDecimal,
+        size: Math.round(shares * 100) / 100,
+        side: Side.SELL,
+        feeRateBps,
+        expiration: 0,
+        taker: '0x0000000000000000000000000000000000000000',
+      };
+      const options = { negRisk: false, postOnly: true } as { negRisk: boolean; postOnly?: boolean };
+      const response = await this.browserClobClient.createAndPostOrder(order, options, OrderType.GTC);
+      const orderId = response?.orderID || (response as any)?.order_id || (response as any)?.id;
+      if (orderId) return { orderId };
+      return { error: (response as any)?.errorMsg || (response as any)?.error || 'No order ID' };
+    } catch (e: any) {
+      return { error: e?.message || e?.errorMsg || String(e) };
+    }
+  }
+
+  /** Place POST_ONLY limit sells at profit target for all positions (aggregated by token). */
+  private async placeProfitTargetLimitSells(activePositions: Position[], profitTarget: number): Promise<void> {
+    if (this.isPlacingExitOrder || activePositions.length === 0 || !this.browserClobClient) return;
+    this.isPlacingExitOrder = true;
+    this.orderPlacementStartTime = Date.now();
+    const aggregatedByToken = this.aggregatePositionsByToken(activePositions);
+    try {
+      for (const [tokenId, data] of aggregatedByToken.entries()) {
+        const result = await this.placePostOnlyLimitSellOrder(tokenId, data.totalShares, profitTarget);
+        if (result.orderId) {
+          this.pendingProfitSellOrders.set(result.orderId, data.positions.map(p => p.id));
+          console.log(`[TradingManager] POST_ONLY limit sell at profit target ${profitTarget.toFixed(2)} placed, orderId: ${result.orderId.substring(0, 8)}...`);
+        } else {
+          console.warn(`[TradingManager] Profit target limit sell failed for token ${tokenId.substring(0, 8)}...:`, result.error);
+        }
+      }
+    } finally {
+      this.isPlacingExitOrder = false;
+      this.orderPlacementStartTime = 0;
+    }
+    this.notifyStatusUpdate();
+  }
+
+  /** Check if any pending profit-target limit sells have filled and remove positions. */
+  private async checkPendingProfitSellFills(): Promise<void> {
+    if (!this.browserClobClient || this.pendingProfitSellOrders.size === 0) return;
+    try {
+      const openOrders = await this.browserClobClient.getOpenOrders();
+      const openIds = new Set((openOrders || []).map((o: { id?: string }) => o.id || (o as any).orderID));
+      for (const [orderId, positionIds] of this.pendingProfitSellOrders.entries()) {
+        if (openIds.has(orderId)) continue;
+        this.pendingProfitSellOrders.delete(orderId);
+        const before = this.positions.length;
+        this.positions = this.positions.filter(p => !positionIds.includes(p.id));
+        this.status.positions = [...this.positions];
+        this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+        this.persistPositions();
+        console.log(`[TradingManager] ✅ Profit target limit sell filled, orderId: ${orderId.substring(0, 8)}..., removed ${before - this.positions.length} position(s)`);
+      }
+    } catch (e) {
+      console.warn('[TradingManager] checkPendingProfitSellFills error:', e);
+    }
+  }
+
+  /**
+   * Legacy: Check both UP and DOWN tokens and place market order when price equals entry price.
+   * Kept for reference; entry now uses POST_ONLY limit at entry-2 via checkAndPlaceLimitOrder.
+   */
+  private async checkAndPlaceMarketOrder(_yesTokenId: string, _noTokenId: string): Promise<void> {
+    // Entry is now done via POST_ONLY limit at entry-2 (checkAndPlaceLimitOrder). Fee Guard: no market entry.
   }
 
   /**
@@ -686,6 +934,7 @@ export class TradingManager {
         this.positions.push(newPosition);
         this.status.positions = [...this.positions];
         this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+        this.persistPositions();
 
         this.trades.push(trade);
         this.status.totalTrades++;
@@ -804,7 +1053,8 @@ export class TradingManager {
 
         // Add to positions array
         this.positions.push(newPosition);
-        
+        this.persistPositions();
+
         // Update status
         this.status.positions = [...this.positions];
         this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
@@ -1010,6 +1260,13 @@ export class TradingManager {
         direction: p.direction,
         size: p.size.toFixed(2),
       })));
+    }
+
+    // If we have pending profit-target limit sells, check for fills before placing new exits
+    if (this.pendingProfitSellOrders.size > 0) {
+      await this.checkPendingProfitSellFills();
+      this.notifyStatusUpdate();
+      return;
     }
 
     // Prevent multiple simultaneous exit orders
@@ -1259,11 +1516,12 @@ export class TradingManager {
 
         // CRITICAL: Exit conditions should ALWAYS execute, even if entry orders are in progress
         if (useAdaptiveSelling) {
-          console.log(`[TradingManager] 🚨 Executing STOP LOSS exit via adaptive selling...`);
+          console.log(`[TradingManager] 🚨 Executing STOP LOSS exit via adaptive selling (market - emergency)...`);
           await this.closeAllPositionsWithAdaptiveSelling(exitReason, stopLoss, isDownDirection, yesPricePercent, noPricePercent);
         } else {
-          console.log(`[TradingManager] 🚨 Executing profit target exit...`);
-          await this.closeAllPositions(exitReason);
+          // Sell for profit: POST_ONLY limit order at profit target (Fee Guard: no taker fee)
+          console.log(`[TradingManager] 🎯 Placing POST_ONLY limit sell at profit target ${profitTarget.toFixed(2)}...`);
+          await this.placeProfitTargetLimitSells(activePositions, profitTarget);
         }
       }
 
@@ -1278,14 +1536,9 @@ export class TradingManager {
    * Uses yesPricePercent and noPricePercent (same as adaptive selling) for consistency
    */
   /**
-   * Place a single SELL order
-   * @param tokenId - Token ID to sell
-   * @param shares - Number of shares to sell (calculated from entry price)
-   * @param direction - UP or DOWN
-   * @param orderIndex - Order index for logging
-   * @param totalOrders - Total orders for logging
-   * @param yesPricePercent - Current YES price
-   * @param noPricePercent - Current NO price
+   * Place a single SELL order (market/FAK).
+   * Fee Guard exception: only used for emergency (Flip Guard distance <$5) and stop loss.
+   * Profit target exits use POST_ONLY limit at profit target via placeProfitTargetLimitSells.
    */
   private async placeSingleSellOrder(
     tokenId: string,
@@ -1672,6 +1925,7 @@ export class TradingManager {
         
         this.status.positions = [...this.positions];
         this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+        this.persistPositions();
         
         console.log(`[TradingManager] 📊 Position cleanup: ${positionsBeforeRemoval} → ${positionsAfterRemoval} (removed ${positionsBeforeRemoval - positionsAfterRemoval})`);
         
@@ -1727,6 +1981,7 @@ export class TradingManager {
             this.positions = this.positions.filter(p => !closedPositionIds.includes(p.id));
             this.status.positions = [...this.positions];
             this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+            this.persistPositions();
             
             const stillOpenPositions = this.getActivePositions();
             if (stillOpenPositions.length > 0) {
@@ -1771,6 +2026,7 @@ export class TradingManager {
             this.positions = this.positions.filter(p => !closedPositionIds.includes(p.id));
             this.status.positions = [...this.positions];
             this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+            this.persistPositions();
             console.log(`[TradingManager] 🔄 EMERGENCY RETRY: Closed ${closedPositionIds.length} of ${activePositions.length} position(s)`);
           }
         }
@@ -1800,6 +2056,7 @@ export class TradingManager {
         this.positions = this.positions.filter(p => !closedPositionIds.includes(p.id));
         this.status.positions = [...this.positions];
         this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+        this.persistPositions();
         this.notifyStatusUpdate();
       }
     } finally {
@@ -2280,7 +2537,11 @@ export class TradingManager {
     this.status.isActive = false;
     this.isMonitoring = false; // Stop continuous monitoring loop
     this.consecutiveFailures = 0; // Reset circuit breaker
-    
+
+    // Clear pending entry and profit-target order tracking (actual cancels done by cancelAllPendingEntryOrders if needed)
+    this.pendingEntryOrders.clear();
+    this.pendingProfitSellOrders.clear();
+
     // Cancel all pending limit orders
     this.cancelAllPendingOrders();
 
@@ -2305,11 +2566,34 @@ export class TradingManager {
     return { ...this.status };
   }
 
+  /** Get all positions (any event). Used by Auto-Redemption Service for resolved markets. */
+  getPositions(): Position[] {
+    return [...this.positions];
+  }
+
+  /** Remove positions by ID (e.g. after redemption). Used by Auto-Redemption Service. */
+  removePositionsByIds(positionIds: string[]): void {
+    if (positionIds.length === 0) return;
+    const set = new Set(positionIds);
+    this.positions = this.positions.filter((p) => !set.has(p.id));
+    this.status.positions = [...this.positions];
+    this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+    this.persistPositions();
+    this.notifyStatusUpdate();
+  }
+
   /**
    * Manually close all positions (public method for UI)
    */
   async closeAllPositionsManually(reason: string = 'Manual sell'): Promise<void> {
     await this.closeAllPositions(reason);
+  }
+
+  /**
+   * Manual emergency sell: close all positions via market sell (same path as Flip Guard / stop loss).
+   */
+  async closeAllPositionsManuallyEmergency(reason: string = 'Manual emergency sell'): Promise<void> {
+    await this.closeAllPositions(reason, true);
   }
 
   /**
@@ -2349,6 +2633,7 @@ export class TradingManager {
     this.positions = this.positions.filter(p => p.id !== positionId);
     this.status.positions = [...this.positions];
     this.status.totalPositionSize = this.positions.reduce((sum, p) => sum + p.size, 0);
+    this.persistPositions();
     
     console.log(`[TradingManager] ✅ Position ${positionId.substring(0, 8)}... closed. ${this.positions.length} position(s) remaining.`);
     
@@ -2362,9 +2647,8 @@ export class TradingManager {
   }
 
   private notifyTradeUpdate(trade: Trade): void {
-    if (this.onTradeUpdate) {
-      this.onTradeUpdate(trade);
-    }
+    this.onTradeUpdate?.(trade);
+    this.onTradePersist?.(trade);
   }
 
   clearTrades(): void {

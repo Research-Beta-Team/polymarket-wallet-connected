@@ -1,8 +1,13 @@
 import { WebSocketClient } from './websocket-client';
 import { MultiAssetEventManager } from './multi-asset-event-manager';
 import { MultiAssetTradingManager } from './multi-asset-trading-manager';
+import { fetchEventState, saveEventState } from './event-state-api';
+import { fetchStrategyConfig, saveStrategyConfig } from './strategy-config-api';
+import { fetchTrades, saveTrade } from './trades-api';
+import { fetchPositions, savePositions } from './positions-api';
 import type { PriceUpdate, ConnectionStatus, AssetType } from './types';
 import { ASSET_CONFIG } from './types';
+import type { StrategyConfig } from './trading-types';
 
 /**
  * Multi-Asset Streaming Platform
@@ -98,9 +103,22 @@ export class MultiAssetStreamingPlatform {
       }
     });
 
-    // Load strategy configs for all assets
+    // Set persistence callbacks and load strategy/trades/positions from Supabase per asset
     for (const asset of assets) {
-      this.tradingManager.getManager(asset)?.loadStrategyConfig();
+      const manager = this.tradingManager.getManager(asset);
+      if (!manager) continue;
+      const scope = asset;
+      manager.setOnStrategySave((config) => {
+        saveStrategyConfig(scope, config as unknown as Record<string, unknown>).catch((e) =>
+          console.warn('[Strategy] Save failed for', scope, e)
+        );
+      });
+      manager.setOnTradePersist((trade) => {
+        saveTrade(scope, trade).catch((e) => console.warn('[Trades] Save failed for', scope, e));
+      });
+      manager.setOnPositionsPersist((positions) => {
+        savePositions(scope, positions).catch((e) => console.warn('[Positions] Save failed for', scope, e));
+      });
     }
   }
 
@@ -112,6 +130,8 @@ export class MultiAssetStreamingPlatform {
       this.renderWalletSection();
       console.log('Loading events for all assets...');
       await this.eventManager.loadAllEvents(10);
+      await this.loadEventStateFromDb();
+      await this.loadTradingDataFromDb();
       this.eventManager.startAutoRefreshAll(60000);
       this.renderTradingSection();
       this.startPriceUpdates();
@@ -174,28 +194,63 @@ export class MultiAssetStreamingPlatform {
 
     const events = this.eventManager.getEvents(asset);
     const activeEvent = events.find(e => e.status === 'active');
-    
-    if (activeEvent) {
-      if (!this.eventPriceToBeat.has(activeEvent.slug)) {
-        const activeEventIndex = events.findIndex(e => e.slug === activeEvent.slug);
-        let priceToBeat: number | null = null;
 
-        if (activeEventIndex > 0) {
-          const previousEvent = events[activeEventIndex - 1];
-          const lastPrice = this.eventLastPrice.get(previousEvent.slug);
-          if (lastPrice !== undefined) {
-            priceToBeat = lastPrice;
-          }
+    // Price to Beat = first value of the asset for the active event (set once when we have no value yet)
+    if (activeEvent && !this.eventPriceToBeat.has(activeEvent.slug)) {
+      this.eventPriceToBeat.set(activeEvent.slug, price);
+      this.persistEventState(activeEvent.slug);
+      this.renderActiveEvent();
+    }
+  }
+
+  private async loadEventStateFromDb(): Promise<void> {
+    try {
+      const state = await fetchEventState();
+      if (state.priceToBeat && Object.keys(state.priceToBeat).length > 0) {
+        for (const [slug, value] of Object.entries(state.priceToBeat)) {
+          this.eventPriceToBeat.set(slug, value);
         }
-
-        if (priceToBeat === null) {
-          priceToBeat = price;
+      }
+      if (state.lastPrice && Object.keys(state.lastPrice).length > 0) {
+        for (const [slug, value] of Object.entries(state.lastPrice)) {
+          this.eventLastPrice.set(slug, value);
         }
+      }
+    } catch (e) {
+      console.warn('[Event State] Load failed:', e instanceof Error ? e.message : e);
+    }
+  }
 
-        this.eventPriceToBeat.set(activeEvent.slug, priceToBeat);
-        this.renderActiveEvent();
+  /** Load strategy config, trades, and positions from Supabase for all assets. */
+  private async loadTradingDataFromDb(): Promise<void> {
+    const assets: AssetType[] = ['btc', 'eth', 'sol', 'xrp'];
+    for (const asset of assets) {
+      const manager = this.tradingManager.getManager(asset);
+      if (!manager) continue;
+      try {
+        const [config, trades, positions] = await Promise.all([
+          fetchStrategyConfig(asset).catch(() => null),
+          fetchTrades(asset).catch(() => []),
+          fetchPositions(asset).catch(() => []),
+        ]);
+        if (config && typeof config === 'object') {
+          manager.loadStrategyFromObject(config as Partial<StrategyConfig>);
+        }
+        if (trades.length > 0) manager.setTrades(trades);
+        if (positions.length > 0) manager.setPositions(positions);
+      } catch (e) {
+        console.warn('[Trading Data] Load failed for', asset, e instanceof Error ? e.message : e);
       }
     }
+  }
+
+  private persistEventState(eventSlug: string): void {
+    const priceToBeat = this.eventPriceToBeat.get(eventSlug);
+    const lastPrice = this.eventLastPrice.get(eventSlug);
+    saveEventState(eventSlug, {
+      ...(priceToBeat !== undefined && { priceToBeat }),
+      ...(lastPrice !== undefined && { lastPrice }),
+    }).catch((e) => console.warn('[Event State] Save failed for', eventSlug, e instanceof Error ? e.message : e));
   }
 
   private capturePriceForExpiredEvent(asset: AssetType): void {
@@ -210,11 +265,10 @@ export class MultiAssetStreamingPlatform {
         
         if (previousEvent.status === 'expired' && !this.eventLastPrice.has(event.slug)) {
           this.eventLastPrice.set(event.slug, price);
-          
           if (event.status === 'active' && !this.eventPriceToBeat.has(event.slug)) {
             this.eventPriceToBeat.set(event.slug, price);
           }
-          
+          this.persistEventState(event.slug);
           if (asset === this.currentAsset) {
             this.renderEventsTable();
             this.renderActiveEvent();
@@ -273,22 +327,7 @@ export class MultiAssetStreamingPlatform {
       });
     }
 
-    // Trading controls
-    const startBtn = document.getElementById('start-trading');
-    const stopBtn = document.getElementById('stop-trading');
-    const saveConfigBtn = document.getElementById('save-strategy-config');
-
-    startBtn?.addEventListener('click', async () => {
-      await this.startTrading();
-    });
-
-    stopBtn?.addEventListener('click', () => {
-      this.stopTrading();
-    });
-
-    saveConfigBtn?.addEventListener('click', () => {
-      this.saveStrategyConfig();
-    });
+    // Trading control buttons are created in renderTradingSection(); listeners attached there via attachTradingControlListeners()
 
     // Wallet controls
     const connectWalletBtn = document.getElementById('connect-wallet');
@@ -305,6 +344,36 @@ export class MultiAssetStreamingPlatform {
 
     initializeSessionBtn?.addEventListener('click', () => {
       this.initializeTradingSession();
+    });
+  }
+
+  /**
+   * Attach listeners to trading control buttons (called after each renderTradingSection so buttons work after re-render).
+   */
+  private attachTradingControlListeners(): void {
+    const startBtn = document.getElementById('start-trading');
+    const stopBtn = document.getElementById('stop-trading');
+    const saveConfigBtn = document.getElementById('save-strategy-config');
+    const emergencySellBtn = document.getElementById('emergency-sell');
+
+    startBtn?.addEventListener('click', async () => {
+      await this.startTrading();
+    });
+    stopBtn?.addEventListener('click', () => {
+      this.stopTrading();
+    });
+    saveConfigBtn?.addEventListener('click', () => {
+      this.saveStrategyConfig();
+    });
+    emergencySellBtn?.addEventListener('click', async () => {
+      if (!confirm('Emergency sell will market-sell all positions for this asset. Continue?')) return;
+      try {
+        const manager = this.tradingManager.getManager(this.currentAsset);
+        await manager?.closeAllPositionsManuallyEmergency();
+        this.renderTradingSection();
+      } catch (e) {
+        console.error('Emergency sell failed:', e);
+      }
     });
   }
 
@@ -650,6 +719,7 @@ export class MultiAssetStreamingPlatform {
         const nextEvent = events[activeIndex + 1];
         if (nextEvent && !this.eventLastPrice.has(nextEvent.slug)) {
           this.eventLastPrice.set(nextEvent.slug, price);
+          this.persistEventState(nextEvent.slug);
         }
       }
       this.stopCountdown();
@@ -721,8 +791,29 @@ export class MultiAssetStreamingPlatform {
         <div class="config-item">
           <label>
             Price Difference (USD):
-            <input type="number" id="price-difference" value="${config.priceDifference || ''}" placeholder="Optional">
+            <input type="number" id="price-difference" value="${config.priceDifference ?? ''}" placeholder="Optional">
             <small>Only trade when |Price to Beat - Current ${ASSET_CONFIG[this.currentAsset].displayName} Price| equals this value. Leave empty to disable.</small>
+          </label>
+        </div>
+        <div class="config-item">
+          <label>
+            Flip Guard Pending (USD):
+            <input type="number" id="flip-guard-pending" value="${config.flipGuardPendingDistanceUsd ?? 15}" min="0" step="0.01">
+            <small>Cancel pending entry bids when price distance drops below this.</small>
+          </label>
+        </div>
+        <div class="config-item">
+          <label>
+            Flip Guard Filled (USD):
+            <input type="number" id="flip-guard-filled" value="${config.flipGuardFilledDistanceUsd ?? 5}" min="0" step="0.01">
+            <small>Emergency market sell when filled and price distance drops below this.</small>
+          </label>
+        </div>
+        <div class="config-item">
+          <label>
+            Entry Time Remaining Max (sec):
+            <input type="number" id="entry-time-remaining-max" value="${config.entryTimeRemainingMaxSeconds ?? 180}" min="0" step="1">
+            <small>Only enter when time left &lt; this many seconds.</small>
           </label>
         </div>
         <button id="save-strategy-config" class="btn btn-primary">Save Configuration</button>
@@ -761,6 +852,7 @@ export class MultiAssetStreamingPlatform {
 
     // Render controls
     const canStartTrading = sessionState?.isInitialized && !status.isActive;
+    const hasPositions = (status.positions?.length ?? 0) > 0;
     controlsDiv.innerHTML = `
       <div class="trading-controls">
         <button id="start-trading" class="btn btn-success" ${!canStartTrading ? 'disabled' : ''}>
@@ -769,11 +861,13 @@ export class MultiAssetStreamingPlatform {
         <button id="stop-trading" class="btn btn-danger" ${!status.isActive ? 'disabled' : ''}>
           Stop ${ASSET_CONFIG[this.currentAsset].displayName} Trading
         </button>
+        <button id="emergency-sell" class="btn btn-danger" ${!hasPositions ? 'disabled' : ''} title="Market sell all positions for this asset">Sell All (Emergency)</button>
         ${!sessionState?.isInitialized ? `
           <p class="trading-warning">⚠️ Trading session not initialized. Please initialize session first.</p>
         ` : ''}
       </div>
     `;
+    this.attachTradingControlListeners();
 
     // Render trades
     if (tradesDiv) {
@@ -907,6 +1001,12 @@ export class MultiAssetStreamingPlatform {
     const priceDifference = priceDifferenceInput && priceDifferenceInput.trim() !== '' 
       ? parseFloat(priceDifferenceInput) 
       : null;
+    const flipGuardPendingInput = (document.getElementById('flip-guard-pending') as HTMLInputElement)?.value;
+    const flipGuardPending = flipGuardPendingInput && flipGuardPendingInput.trim() !== '' ? parseFloat(flipGuardPendingInput) : undefined;
+    const flipGuardFilledInput = (document.getElementById('flip-guard-filled') as HTMLInputElement)?.value;
+    const flipGuardFilled = flipGuardFilledInput && flipGuardFilledInput.trim() !== '' ? parseFloat(flipGuardFilledInput) : undefined;
+    const entryTimeMaxInput = (document.getElementById('entry-time-remaining-max') as HTMLInputElement)?.value;
+    const entryTimeRemainingMaxSeconds = entryTimeMaxInput && entryTimeMaxInput.trim() !== '' ? parseFloat(entryTimeMaxInput) : undefined;
 
     this.tradingManager.updateStrategyConfig(this.currentAsset, {
       enabled,
@@ -915,6 +1015,9 @@ export class MultiAssetStreamingPlatform {
       stopLossPrice: stopLoss,
       tradeSize,
       priceDifference,
+      flipGuardPendingDistanceUsd: flipGuardPending,
+      flipGuardFilledDistanceUsd: flipGuardFilled,
+      entryTimeRemainingMaxSeconds,
     });
 
     alert(`Strategy configuration saved for ${ASSET_CONFIG[this.currentAsset].displayName}!`);

@@ -12,6 +12,12 @@ export interface StrategyConfig {
   // If not set (null/undefined), strategy works without this condition
   priceDifference?: number | null; // e.g., 100 (only trade if BTC price moved $100 from Price to Beat)
   // Direction is automatically determined by which token (UP/DOWN) reaches entry price first
+  // Flip Guard: cancel pending entry bids when price distance (USD) drops below this
+  flipGuardPendingDistanceUsd?: number; // default 15
+  // Flip Guard: emergency market sell when filled and price distance (USD) drops below this
+  flipGuardFilledDistanceUsd?: number; // default 5
+  // Only enter when time remaining (seconds) is less than this
+  entryTimeRemainingMaxSeconds?: number; // default 180 (3 min)
 }
 
 export interface Trade {

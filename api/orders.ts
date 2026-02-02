@@ -192,10 +192,12 @@ export default async function handler(
       let response;
 
       if (order) {
-        // Use provided order object
+        // Use provided order object (Fee Guard: pass postOnly when provided to avoid taker fee)
+        const options: { negRisk: boolean; postOnly?: boolean } = { negRisk: negRisk ?? false };
+        if (body.postOnly === true) options.postOnly = true;
         response = await clobClient.createAndPostOrder(
           order,
-          { negRisk: negRisk ?? false },
+          options,
           OrderType.GTC
         );
       } else if (tokenId && size !== undefined && side) {
@@ -379,9 +381,12 @@ export default async function handler(
             taker: '0x0000000000000000000000000000000000000000',
           };
 
+          // Fee Guard: use POST_ONLY for limit orders to avoid 3.15% taker fee (unless explicitly not postOnly)
+          const limitOptions: { negRisk: boolean; postOnly?: boolean } = { negRisk: negRisk ?? false };
+          if (body.postOnly !== false) limitOptions.postOnly = true;
           response = await clobClient.createAndPostOrder(
             limitOrder,
-            { negRisk: negRisk ?? false },
+            limitOptions,
             OrderType.GTC
           );
         }

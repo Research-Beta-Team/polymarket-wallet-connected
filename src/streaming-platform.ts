@@ -1,7 +1,9 @@
 import { WebSocketClient } from './websocket-client';
 import { EventManager } from './event-manager';
 import { TradingManager } from './trading-manager';
+import { RedemptionService } from './redemption-service';
 import { getNext15MinIntervals } from './event-utils';
+import { fetchEventState, saveEventState } from './event-state-api';
 import type { PriceUpdate, ConnectionStatus } from './types';
 
 export class StreamingPlatform {
@@ -23,6 +25,7 @@ export class StreamingPlatform {
   private upPrice: number | null = null; // Current UP token price (0-100 scale)
   private downPrice: number | null = null; // Current DOWN token price (0-100 scale)
   private priceUpdateInterval: number | null = null; // Interval for updating UP/DOWN prices
+  private redemptionService: RedemptionService | null = null; // Auto-redemption for resolved markets (background)
   // Wallet connection state
   private walletState: {
     eoaAddress: string | null;
@@ -69,6 +72,18 @@ export class StreamingPlatform {
       }
     });
     this.tradingManager.loadStrategyConfig();
+    this.redemptionService = new RedemptionService({
+      getPositions: () => this.tradingManager.getPositions(),
+      removePositions: (ids) => this.tradingManager.removePositionsByIds(ids),
+      onRedemptionSuccess: (eventSlug, positionIds) => {
+        console.log('[Redemption] Redeemed winning tokens:', eventSlug, positionIds.length, 'position(s)');
+        this.renderTradingSection();
+        this.fetchBalance();
+      },
+      onRedemptionError: (eventSlug, error) => {
+        console.warn('[Redemption] Error for', eventSlug, error);
+      },
+    });
   }
 
   async initialize(): Promise<void> {
@@ -79,6 +94,7 @@ export class StreamingPlatform {
       this.renderWalletSection(); // Initialize wallet section UI
       console.log('Loading events...');
       await this.loadEvents();
+      await this.loadEventStateFromDb();
       this.eventManager.startAutoRefresh(60000); // Refresh every minute
       this.renderTradingSection(); // Initialize trading section UI
       this.startPriceUpdates(); // Start updating UP/DOWN prices
@@ -152,6 +168,17 @@ export class StreamingPlatform {
       }
     });
 
+    const emergencySellBtn = document.getElementById('emergency-sell');
+    emergencySellBtn?.addEventListener('click', async () => {
+      if (!confirm('Emergency sell will market-sell all positions. Continue?')) return;
+      try {
+        await this.tradingManager.closeAllPositionsManuallyEmergency();
+        this.renderTradingSection();
+      } catch (e) {
+        console.error('Emergency sell failed:', e);
+      }
+    });
+
     // Orders section event listeners
     const refreshOrdersBtn = document.getElementById('refresh-orders');
     refreshOrdersBtn?.addEventListener('click', () => {
@@ -217,18 +244,13 @@ export class StreamingPlatform {
         
         // If previous event is expired and we haven't stored the last price for the next event yet
         if (previousEvent.status === 'expired' && !this.eventLastPrice.has(event.slug) && this.currentPrice !== null) {
-          // Store the current price as the last price (price at the last second of previous event)
-          // This will be used as "Price to Beat" for the next event when it becomes active
           this.eventLastPrice.set(event.slug, this.currentPrice);
-          console.log(`[Last Price] Captured last price for event ${event.slug} from expired event ${previousEvent.slug}: $${this.currentPrice.toFixed(2)}`);
-          
-          // If this event is now active, set it as price to beat
           if (event.status === 'active' && !this.eventPriceToBeat.has(event.slug)) {
             this.eventPriceToBeat.set(event.slug, this.currentPrice);
             console.log(`[Price to Beat] Set price to beat for active event ${event.slug}: $${this.currentPrice.toFixed(2)}`);
           }
-          
-          // Re-render to show the last price and update active event
+          this.persistEventState(event.slug);
+          console.log(`[Last Price] Captured last price for event ${event.slug} from expired event ${previousEvent.slug}: $${this.currentPrice.toFixed(2)}`);
           this.renderEventsTable();
           this.renderActiveEvent();
         }
@@ -241,38 +263,45 @@ export class StreamingPlatform {
 
     const events = this.eventManager.getEvents();
     const activeEvent = events.find(e => e.status === 'active');
-    
-    if (activeEvent) {
-      // If we don't have a price to beat for this event yet, capture it
-      if (!this.eventPriceToBeat.has(activeEvent.slug)) {
-        // Price to Beat should be the price from the last second of the previous event
-        // Check if we have the last price from the previous event
-        const activeEventIndex = events.findIndex(e => e.slug === activeEvent.slug);
-        let priceToBeat: number | null = null;
 
-        if (activeEventIndex > 0) {
-          // Get the previous event
-          const previousEvent = events[activeEventIndex - 1];
-          // Use the last price from the previous event (captured at its last second)
-          const lastPrice = this.eventLastPrice.get(previousEvent.slug);
-          if (lastPrice !== undefined) {
-            priceToBeat = lastPrice;
-            console.log(`[Price to Beat] Using last price from previous event ${previousEvent.slug}: $${priceToBeat.toFixed(2)}`);
-          }
-        }
-
-        // If we don't have the previous event's last price, use current price as fallback
-        // This handles the case where the app starts during an active event
-        if (priceToBeat === null) {
-          priceToBeat = this.currentPrice;
-          console.log(`[Price to Beat] Using current price as fallback: $${priceToBeat.toFixed(2)}`);
-        }
-
-        this.eventPriceToBeat.set(activeEvent.slug, priceToBeat);
-        // Re-render active event to show the price
-        this.renderActiveEvent();
-      }
+    // Price to Beat = first BTC value of the active event (set once when we have no value yet)
+    if (activeEvent && !this.eventPriceToBeat.has(activeEvent.slug)) {
+      this.eventPriceToBeat.set(activeEvent.slug, this.currentPrice);
+      this.persistEventState(activeEvent.slug);
+      console.log(`[Price to Beat] Set first BTC value for active event ${activeEvent.slug}: $${this.currentPrice.toFixed(2)}`);
+      this.renderActiveEvent();
     }
+  }
+
+  /** Load persisted price-to-beat and last-price from Supabase (survives reload). */
+  private async loadEventStateFromDb(): Promise<void> {
+    try {
+      const state = await fetchEventState();
+      if (state.priceToBeat && Object.keys(state.priceToBeat).length > 0) {
+        for (const [slug, value] of Object.entries(state.priceToBeat)) {
+          this.eventPriceToBeat.set(slug, value);
+        }
+        console.log('[Event State] Loaded price-to-beat for', Object.keys(state.priceToBeat).length, 'event(s)');
+      }
+      if (state.lastPrice && Object.keys(state.lastPrice).length > 0) {
+        for (const [slug, value] of Object.entries(state.lastPrice)) {
+          this.eventLastPrice.set(slug, value);
+        }
+        console.log('[Event State] Loaded last-price for', Object.keys(state.lastPrice).length, 'event(s)');
+      }
+    } catch (e) {
+      console.warn('[Event State] Load failed (DB may not be configured):', e instanceof Error ? e.message : e);
+    }
+  }
+
+  /** Persist price-to-beat and last-price for an event to Supabase (fire-and-forget). */
+  private persistEventState(eventSlug: string): void {
+    const priceToBeat = this.eventPriceToBeat.get(eventSlug);
+    const lastPrice = this.eventLastPrice.get(eventSlug);
+    saveEventState(eventSlug, {
+      ...(priceToBeat !== undefined && { priceToBeat }),
+      ...(lastPrice !== undefined && { lastPrice }),
+    }).catch((e) => console.warn('[Event State] Save failed for', eventSlug, e instanceof Error ? e.message : e));
   }
 
   private handleStatusChange(status: ConnectionStatus): void {
@@ -388,8 +417,8 @@ export class StreamingPlatform {
         
         // If previous event is expired and we have a current price, store it as last price for this event
         if (previousEvent.status === 'expired' && !this.eventLastPrice.has(event.slug) && this.currentPrice !== null) {
-          // Use current price as the last price (price when previous event ended)
           this.eventLastPrice.set(event.slug, this.currentPrice);
+          this.persistEventState(event.slug);
         }
       }
     });
@@ -434,6 +463,7 @@ export class StreamingPlatform {
           const nextEvent = events[activeIndex + 1];
           if (nextEvent && !this.eventLastPrice.has(nextEvent.slug)) {
             this.eventLastPrice.set(nextEvent.slug, this.currentPrice);
+            this.persistEventState(nextEvent.slug);
           }
         }
       }
@@ -627,6 +657,7 @@ export class StreamingPlatform {
     // If we have a current price but no stored price to beat, capture it now
     if (priceToBeat === undefined && this.currentPrice !== null) {
       this.eventPriceToBeat.set(activeEvent.slug, this.currentPrice);
+      this.persistEventState(activeEvent.slug);
     }
 
     activeEventContainer.innerHTML = `
@@ -909,6 +940,27 @@ export class StreamingPlatform {
                 </div>
                 <div class="config-item">
                   <label>
+                    Flip Guard Pending (USD):
+                    <input type="number" id="flip-guard-pending" min="0" step="0.01" />
+                    <small>Cancel pending entry bids when price distance drops below this (default 15).</small>
+                  </label>
+                </div>
+                <div class="config-item">
+                  <label>
+                    Flip Guard Filled (USD):
+                    <input type="number" id="flip-guard-filled" min="0" step="0.01" />
+                    <small>Emergency market sell when filled and price distance drops below this (default 5).</small>
+                  </label>
+                </div>
+                <div class="config-item">
+                  <label>
+                    Entry Time Remaining Max (sec):
+                    <input type="number" id="entry-time-remaining-max" min="0" step="1" />
+                    <small>Only enter when time left &lt; this many seconds (default 180).</small>
+                  </label>
+                </div>
+                <div class="config-item">
+                  <label>
                     <small>Direction: Automatically determined (UP or DOWN, whichever reaches entry price first)</small>
                   </label>
                 </div>
@@ -923,6 +975,7 @@ export class StreamingPlatform {
               <div class="trading-actions">
                 <button id="start-trading" class="btn btn-primary">Start Trading</button>
                 <button id="stop-trading" class="btn btn-secondary">Stop Trading</button>
+                <button id="emergency-sell" class="btn btn-danger" title="Market sell all positions">Sell All (Emergency)</button>
                 <button id="clear-trades" class="btn btn-secondary">Clear Trades</button>
               </div>
             </div>
@@ -964,6 +1017,12 @@ export class StreamingPlatform {
     const priceDifference = priceDifferenceInput && priceDifferenceInput.trim() !== '' 
       ? parseFloat(priceDifferenceInput) 
       : null;
+    const flipGuardPendingInput = (document.getElementById('flip-guard-pending') as HTMLInputElement)?.value;
+    const flipGuardPending = flipGuardPendingInput && flipGuardPendingInput.trim() !== '' ? parseFloat(flipGuardPendingInput) : undefined;
+    const flipGuardFilledInput = (document.getElementById('flip-guard-filled') as HTMLInputElement)?.value;
+    const flipGuardFilled = flipGuardFilledInput && flipGuardFilledInput.trim() !== '' ? parseFloat(flipGuardFilledInput) : undefined;
+    const entryTimeMaxInput = (document.getElementById('entry-time-remaining-max') as HTMLInputElement)?.value;
+    const entryTimeRemainingMaxSeconds = entryTimeMaxInput && entryTimeMaxInput.trim() !== '' ? parseFloat(entryTimeMaxInput) : undefined;
 
     this.tradingManager.setStrategyConfig({
       enabled,
@@ -972,6 +1031,9 @@ export class StreamingPlatform {
       stopLossPrice,
       tradeSize,
       priceDifference,
+      flipGuardPendingDistanceUsd: flipGuardPending,
+      flipGuardFilledDistanceUsd: flipGuardFilled,
+      entryTimeRemainingMaxSeconds,
     });
 
     alert('Strategy configuration saved!');
@@ -989,6 +1051,9 @@ export class StreamingPlatform {
     const stopLossPriceInput = document.getElementById('stop-loss-price') as HTMLInputElement;
     const tradeSizeInput = document.getElementById('trade-size') as HTMLInputElement;
     const priceDifferenceInput = document.getElementById('price-difference') as HTMLInputElement;
+    const flipGuardPendingInput = document.getElementById('flip-guard-pending') as HTMLInputElement;
+    const flipGuardFilledInput = document.getElementById('flip-guard-filled') as HTMLInputElement;
+    const entryTimeRemainingMaxInput = document.getElementById('entry-time-remaining-max') as HTMLInputElement;
 
     if (enabledInput) enabledInput.checked = config.enabled;
     if (entryPriceInput) entryPriceInput.value = config.entryPrice.toString();
@@ -1000,6 +1065,9 @@ export class StreamingPlatform {
         ? config.priceDifference.toString() 
         : '';
     }
+    if (flipGuardPendingInput) flipGuardPendingInput.value = config.flipGuardPendingDistanceUsd != null ? config.flipGuardPendingDistanceUsd.toString() : '15';
+    if (flipGuardFilledInput) flipGuardFilledInput.value = config.flipGuardFilledDistanceUsd != null ? config.flipGuardFilledDistanceUsd.toString() : '5';
+    if (entryTimeRemainingMaxInput) entryTimeRemainingMaxInput.value = config.entryTimeRemainingMaxSeconds != null ? config.entryTimeRemainingMaxSeconds.toString() : '180';
 
     // Update trading status display
     const statusDisplay = document.getElementById('trading-status-display');
@@ -1204,6 +1272,7 @@ export class StreamingPlatform {
       console.log('[Wallet] Stopped active trading');
     }
     
+    this.redemptionService?.stop();
     // Reset wallet state
     this.walletState.isConnected = false;
     this.walletState.isInitialized = false;
@@ -1249,6 +1318,7 @@ export class StreamingPlatform {
       }
 
       this.walletState.isInitialized = true;
+      this.redemptionService?.start();
       this.walletState.error = null;
 
       // Store API credentials in trading manager and wallet state

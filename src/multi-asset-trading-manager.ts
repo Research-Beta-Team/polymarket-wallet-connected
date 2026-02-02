@@ -204,6 +204,9 @@ export class MultiAssetTradingManager {
       stopLossPrice: 91,
       tradeSize: 50,
       priceDifference: null,
+      flipGuardPendingDistanceUsd: 15,
+      flipGuardFilledDistanceUsd: 5,
+      entryTimeRemainingMaxSeconds: 180,
     };
   }
 
